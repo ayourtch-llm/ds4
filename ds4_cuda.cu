@@ -2597,79 +2597,68 @@ __device__ static void comp_kv_mma_scores_16x8(
     const uint32_t gid = lane >> 2u;
     if (n_rows > 16u) n_rows = 16u;
 
-    /* ---- Pack B matrix: Q[32×8] for one K-chunk ----
-     * B layout: b0 holds bytes for heads 0..3, b1 for heads 4..7
-     * Each register: 4 bytes at K-positions gid, gid+8, gid+16, gid+24
-     * at head-column tid (b0) or tid+4 (b1). */
-
-    /* We'll iterate over K-chunks of 32 within the 448 nope dims.
-     * For each chunk, pack Q and KV into registers and call MMA.
-     * Accumulate the f32 results across chunks. */
+    /* Empirically verified layout on Blackwell (sm_120):
+     *   A: row = gid (0..7), a0/a2 = top half, a1/a3 = bottom half
+     *      K-columns packed as consecutive bytes, order doesn't matter
+     *      as long as B uses the SAME packing order
+     *   B: column (head) = gid, K packed same as A
+     *   D: d0=D[gid][tid*2], d1=D[gid][tid*2+1],
+     *      d2=D[gid+8][tid*2], d3=D[gid+8][tid*2+1]
+     *
+     * Packing strategy: each thread loads 4 consecutive K-values per register.
+     * Thread's A registers hold data for rows gid (top) and gid+8 (bottom).
+     * Thread's B registers hold Q data for heads gid (column). */
 
     float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
 
-    /* Precompute row pointers for the 4 rows this thread touches in A.
-     * tid selects row pairs: rows 2*tid, 2*tid+1 (top half)
-     *                        rows 2*tid+8, 2*tid+9 (bottom half) */
-    const uint8_t *nope_ptrs[4];
-    const float *scale_ptrs[4];
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        uint32_t r = (i < 2) ? (2u * tid + i) : (2u * tid + 6u + i);
-        if (r < n_rows) {
-            const uint8_t *rb = comp_kv + (uint64_t)(row_start + r) * DS4_FP8_ROW_STRIDE;
-            nope_ptrs[i] = rb + DS4_FP8_NOPE_OFF;
-            scale_ptrs[i] = (const float *)(rb + DS4_FP8_SCALES_OFF);
-        } else {
-            nope_ptrs[i] = NULL;
-            scale_ptrs[i] = NULL;
-        }
+    /* Precompute row pointers for this thread's 2 rows */
+    const uint8_t *nope_top = NULL, *nope_bot = NULL;
+    const float *scale_top = NULL, *scale_bot = NULL;
+    if (gid < n_rows) {
+        const uint8_t *rb = comp_kv + (uint64_t)(row_start + gid) * DS4_FP8_ROW_STRIDE;
+        nope_top = rb + DS4_FP8_NOPE_OFF;
+        scale_top = (const float *)(rb + DS4_FP8_SCALES_OFF);
+    }
+    if (gid + 8u < n_rows) {
+        const uint8_t *rb = comp_kv + (uint64_t)(row_start + gid + 8u) * DS4_FP8_ROW_STRIDE;
+        nope_bot = rb + DS4_FP8_NOPE_OFF;
+        scale_bot = (const float *)(rb + DS4_FP8_SCALES_OFF);
     }
 
-    /* Iterate over 7 scale blocks (64 dims each = 2 K-chunks of 32).
-     * Accumulate unscaled partial into p0..p3, then multiply by scale. */
+    /* B column = gid → this thread loads Q for head gid.
+     * b0 and b1 are the two halves of K for that head. */
+    const float *qh = q_heads[gid];
+
     for (uint32_t blk = 0; blk < DS4_FP8_N_BLOCKS; blk++) {
         float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
 
         #pragma unroll
         for (uint32_t sub = 0; sub < 2u; sub++) {
             const uint32_t kbase = blk * 64u + sub * 32u;
+            const uint32_t k0 = kbase + tid * 4u;
+            const uint32_t k1 = kbase + tid * 4u + 16u;
 
-            /* Pack B (Q): 8 heads × 32 dims → b0 (heads 0..3), b1 (heads 4..7) */
-            const float *qh0 = q_heads[tid];
-            const float *qh1 = q_heads[tid + 4u];
+            /* Pack A: 4 consecutive nope bytes per register.
+             * a0 = kv_top[k0..k0+3], a1 = kv_bot[k0..k0+3]
+             * a2 = kv_top[k1..k1+3], a3 = kv_bot[k1..k1+3] */
+            uint32_t a0 = nope_top ? *(const uint32_t *)(nope_top + k0) : 0u;
+            uint32_t a1 = nope_bot ? *(const uint32_t *)(nope_bot + k0) : 0u;
+            uint32_t a2 = nope_top ? *(const uint32_t *)(nope_top + k1) : 0u;
+            uint32_t a3 = nope_bot ? *(const uint32_t *)(nope_bot + k1) : 0u;
+
+            /* Pack B: quantize Q for head gid.
+             * b0 = q[k0..k0+3], b1 = q[k1..k1+3] (matching A's layout) */
             uint32_t b0 = pack4(
-                (uint8_t)__nv_cvt_float_to_fp8(qh0[kbase + gid],      __NV_SATFINITE, __NV_E4M3),
-                (uint8_t)__nv_cvt_float_to_fp8(qh0[kbase + gid + 8u], __NV_SATFINITE, __NV_E4M3),
-                (uint8_t)__nv_cvt_float_to_fp8(qh0[kbase + gid + 16u],__NV_SATFINITE, __NV_E4M3),
-                (uint8_t)__nv_cvt_float_to_fp8(qh0[kbase + gid + 24u],__NV_SATFINITE, __NV_E4M3));
+                (uint8_t)__nv_cvt_float_to_fp8(qh[k0],     __NV_SATFINITE, __NV_E4M3),
+                (uint8_t)__nv_cvt_float_to_fp8(qh[k0 + 1u],__NV_SATFINITE, __NV_E4M3),
+                (uint8_t)__nv_cvt_float_to_fp8(qh[k0 + 2u],__NV_SATFINITE, __NV_E4M3),
+                (uint8_t)__nv_cvt_float_to_fp8(qh[k0 + 3u],__NV_SATFINITE, __NV_E4M3));
             uint32_t b1 = pack4(
-                (uint8_t)__nv_cvt_float_to_fp8(qh1[kbase + gid],      __NV_SATFINITE, __NV_E4M3),
-                (uint8_t)__nv_cvt_float_to_fp8(qh1[kbase + gid + 8u], __NV_SATFINITE, __NV_E4M3),
-                (uint8_t)__nv_cvt_float_to_fp8(qh1[kbase + gid + 16u],__NV_SATFINITE, __NV_E4M3),
-                (uint8_t)__nv_cvt_float_to_fp8(qh1[kbase + gid + 24u],__NV_SATFINITE, __NV_E4M3));
+                (uint8_t)__nv_cvt_float_to_fp8(qh[k1],     __NV_SATFINITE, __NV_E4M3),
+                (uint8_t)__nv_cvt_float_to_fp8(qh[k1 + 1u],__NV_SATFINITE, __NV_E4M3),
+                (uint8_t)__nv_cvt_float_to_fp8(qh[k1 + 2u],__NV_SATFINITE, __NV_E4M3),
+                (uint8_t)__nv_cvt_float_to_fp8(qh[k1 + 3u],__NV_SATFINITE, __NV_E4M3));
 
-            /* Pack A (KV): 16 rows × 32 dims, gathered into 4 registers */
-            uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
-            #pragma unroll
-            for (int half = 0; half < 2; half++) {
-                const uint8_t *n0 = nope_ptrs[half * 2];
-                const uint8_t *n1 = nope_ptrs[half * 2 + 1];
-                uint32_t ax = pack4(
-                    n0 ? n0[kbase + gid]       : 0u,
-                    n0 ? n0[kbase + gid + 16u] : 0u,
-                    n1 ? n1[kbase + gid]       : 0u,
-                    n1 ? n1[kbase + gid + 16u] : 0u);
-                uint32_t ay = pack4(
-                    n0 ? n0[kbase + gid + 8u]  : 0u,
-                    n0 ? n0[kbase + gid + 24u] : 0u,
-                    n1 ? n1[kbase + gid + 8u]  : 0u,
-                    n1 ? n1[kbase + gid + 24u] : 0u);
-                if (half == 0) { a0 = ax; a1 = ay; }
-                else           { a2 = ax; a3 = ay; }
-            }
-
-            /* MMA: P[16×8] += A[16×32] × B[32×8] */
             asm volatile(
                 "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
                 "{%0, %1, %2, %3}, "
@@ -2682,18 +2671,8 @@ __device__ static void comp_kv_mma_scores_16x8(
                   "f"(p0), "f"(p1), "f"(p2), "f"(p3));
         }
 
-        /* Apply per-row block scale to the partial results.
-         * MMA output: d0,d1 = row gid (0..7), d2,d3 = row gid+8 (8..15).
-         * Each row has its own scale. Read scale for the output rows. */
-        float s_top = 0.0f, s_bot = 0.0f;
-        if (gid < n_rows) {
-            const uint8_t *rb_top = comp_kv + (uint64_t)(row_start + gid) * DS4_FP8_ROW_STRIDE;
-            s_top = ((const float *)(rb_top + DS4_FP8_SCALES_OFF))[blk];
-        }
-        if (gid + 8u < n_rows) {
-            const uint8_t *rb_bot = comp_kv + (uint64_t)(row_start + gid + 8u) * DS4_FP8_ROW_STRIDE;
-            s_bot = ((const float *)(rb_bot + DS4_FP8_SCALES_OFF))[blk];
-        }
+        float s_top = scale_top ? scale_top[blk] : 0.0f;
+        float s_bot = scale_bot ? scale_bot[blk] : 0.0f;
         d0 += p0 * s_top;
         d1 += p1 * s_top;
         d2 += p2 * s_bot;

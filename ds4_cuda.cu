@@ -4066,12 +4066,10 @@ __global__ static void attention_decode_mma_online_kernel(
         __syncthreads();
     }
 
-    /* ---- Phase B: Comp KV rows via MMA scores + direct L1 output accum ---- */
+    /* ---- Phase B: Comp KV — MMA scores + shared mem output accum ---- */
     for (uint32_t comp0 = 0; comp0 < comp_count; comp0 += 16u) {
         const uint32_t nc = comp_count - comp0 < 16u ? comp_count - comp0 : 16u;
 
-        /* All warps compute MMA scores (each gets 16×8 tile).
-         * Only warp 0's result is used (all warps compute same thing for MQA). */
         {
             const float *q_base = q + (uint64_t)t * n_head * head_dim;
             const float *q_arr[8];
@@ -4081,64 +4079,33 @@ __global__ static void attention_decode_mma_online_kernel(
         }
         __syncthreads();
 
-        /* Each warp processes its head's scores + output accumulation.
-         * KV data read directly from global memory (L1 cached). */
-        if (valid_head) {
-            const uint32_t local_head = head - head_group * 8u;
-            for (uint32_t ci = 0; ci < nc; ci++) {
-                float score = mma_scores[ci * 8u + local_head] * attn_scale;
-                const float new_m = fmaxf(max_s, score);
-                const float os = expf(max_s - new_m), rs = expf(score - new_m);
-                sum_s = sum_s * os + rs;
-
-                const uint8_t *rb = comp_kv + (uint64_t)(comp0 + ci) * DS4_FP8_ROW_STRIDE;
-                const float *sc = (const float *)(rb + DS4_FP8_SCALES_OFF);
-                const uint8_t *nope = rb + DS4_FP8_NOPE_OFF;
-                const __half *rope = (const __half *)(rb + DS4_FP8_ROPE_OFF);
-
-                float4 k0, k1, k2, k3;
-                #pragma unroll
-                for (int reg = 0; reg < 4; reg++) {
-                    uint32_t base = (lane + reg * 32u) * 4u;
-                    float4 kv;
-                    if (base + 3u < DS4_FP8_N_NOPE) {
-                        uint32_t packed = *(const uint32_t *)(nope + base);
-                        float s = sc[base >> 6u];
-                        __nv_fp8x2_storage_t lo = (__nv_fp8x2_storage_t)(packed & 0xFFFFu);
-                        __nv_fp8x2_storage_t hi = (__nv_fp8x2_storage_t)((packed >> 16) & 0xFFFFu);
-                        __half2_raw hlo = __nv_cvt_fp8x2_to_halfraw2(lo, __NV_E4M3);
-                        __half2_raw hhi = __nv_cvt_fp8x2_to_halfraw2(hi, __NV_E4M3);
-                        kv.x = __half2float(*(__half *)&hlo.x) * s;
-                        kv.y = __half2float(*(__half *)&hlo.y) * s;
-                        kv.z = __half2float(*(__half *)&hhi.x) * s;
-                        kv.w = __half2float(*(__half *)&hhi.y) * s;
-                    } else if (base >= DS4_FP8_N_NOPE) {
-                        uint32_t ri = base - DS4_FP8_N_NOPE;
-                        kv.x = (ri < DS4_FP8_N_ROPE) ? __half2float(rope[ri]) : 0.0f;
-                        kv.y = (ri+1u < DS4_FP8_N_ROPE) ? __half2float(rope[ri+1u]) : 0.0f;
-                        kv.z = (ri+2u < DS4_FP8_N_ROPE) ? __half2float(rope[ri+2u]) : 0.0f;
-                        kv.w = (ri+3u < DS4_FP8_N_ROPE) ? __half2float(rope[ri+3u]) : 0.0f;
-                    } else {
-                        kv.x = kv.y = kv.z = kv.w = 0.0f;
-                        for (uint32_t i = 0; i < 4u; i++) {
-                            uint32_t dd = base + i;
-                            float v = (dd < DS4_FP8_N_NOPE) ? e4m3_hw_to_float(nope[dd]) * sc[dd >> 6u]
-                                    : (dd < head_dim) ? __half2float(rope[dd - DS4_FP8_N_NOPE]) : 0.0f;
-                            ((float *)&kv)[i] = v;
-                        }
-                    }
-                    if (reg == 0) k0 = kv; else if (reg == 1) k1 = kv;
-                    else if (reg == 2) k2 = kv; else k3 = kv;
-                }
-
-                o0.x=o0.x*os+k0.x*rs; o0.y=o0.y*os+k0.y*rs; o0.z=o0.z*os+k0.z*rs; o0.w=o0.w*os+k0.w*rs;
-                o1.x=o1.x*os+k1.x*rs; o1.y=o1.y*os+k1.y*rs; o1.z=o1.z*os+k1.z*rs; o1.w=o1.w*os+k1.w*rs;
-                o2.x=o2.x*os+k2.x*rs; o2.y=o2.y*os+k2.y*rs; o2.z=o2.z*os+k2.z*rs; o2.w=o2.w*os+k2.w*rs;
-                o3.x=o3.x*os+k3.x*rs; o3.y=o3.y*os+k3.y*rs; o3.z=o3.z*os+k3.z*rs; o3.w=o3.w*os+k3.w*rs;
-                max_s = new_m;
+        const uint32_t local_head = head - head_group * 8u;
+        for (uint32_t sub0 = 0; sub0 < nc; sub0 += 4u) {
+            const uint32_t nr = nc - sub0 < 4u ? nc - sub0 : 4u;
+            for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
+                const uint32_t rr = off >> 7u;
+                const uint32_t c4 = off & 127u;
+                kv_shared[off] = comp_kv_load4(comp_kv, (uint64_t)(comp0 + sub0 + rr) * head_dim + c4 * 4);
             }
+            __syncthreads();
+            if (valid_head) {
+                for (uint32_t rr = 0; rr < nr; rr++) {
+                    float score = mma_scores[(sub0 + rr) * 8u + local_head] * attn_scale;
+                    const float4 *kv4 = kv_shared + rr * 128u;
+                    float4 k0 = kv4[lane]; float4 k1 = kv4[lane + 32u];
+                    float4 k2 = kv4[lane + 64u]; float4 k3 = kv4[lane + 96u];
+                    const float new_m = fmaxf(max_s, score);
+                    const float os = expf(max_s - new_m), rs = expf(score - new_m);
+                    sum_s = sum_s * os + rs;
+                    o0.x=o0.x*os+k0.x*rs; o0.y=o0.y*os+k0.y*rs; o0.z=o0.z*os+k0.z*rs; o0.w=o0.w*os+k0.w*rs;
+                    o1.x=o1.x*os+k1.x*rs; o1.y=o1.y*os+k1.y*rs; o1.z=o1.z*os+k1.z*rs; o1.w=o1.w*os+k1.w*rs;
+                    o2.x=o2.x*os+k2.x*rs; o2.y=o2.y*os+k2.y*rs; o2.z=o2.z*os+k2.z*rs; o2.w=o2.w*os+k2.w*rs;
+                    o3.x=o3.x*os+k3.x*rs; o3.y=o3.y*os+k3.y*rs; o3.z=o3.z*os+k3.z*rs; o3.w=o3.w*os+k3.w*rs;
+                    max_s = new_m;
+                }
+            }
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     /* ---- Sink + store ---- */
@@ -4280,10 +4247,13 @@ __global__ static void attention_indexed_mma_online_kernel(
         __syncthreads();
     }
 
-    /* Phase B: Comp KV rows via MMA scores + direct L1 output accum */
+    /* Phase B: Comp KV rows — MMA scores + shared mem output accumulation.
+     * Batch 16 rows for MMA scores, then sub-batch 4 rows for cooperative
+     * shared memory load (same as original kernel's output path). */
     for (uint32_t ci0 = 0; ci0 < comp_count; ci0 += 16u) {
         const uint32_t nc = comp_count - ci0 < 16u ? comp_count - ci0 : 16u;
 
+        /* MMA: compute scores for 16 rows × 8 heads */
         {
             const float *q_base = q + (uint64_t)t * n_head * head_dim;
             const float *q_arr[8];
@@ -4293,65 +4263,34 @@ __global__ static void attention_indexed_mma_online_kernel(
         }
         __syncthreads();
 
-        if (valid_head) {
-            const uint32_t local_head = head - head_group * 8u;
-            for (uint32_t ci = 0; ci < nc; ci++) {
-                float score = mma_scores[ci * 8u + local_head] * attn_scale;
-                const float new_m = fmaxf(max_s, score);
-                const float os = expf(max_s - new_m), rs = expf(score - new_m);
-                sum_s = sum_s * os + rs;
-
-                const uint8_t *rb = comp_kv + (uint64_t)comp_rows[ci0 + ci] * DS4_FP8_ROW_STRIDE;
-                const float *sc = (const float *)(rb + DS4_FP8_SCALES_OFF);
-                const uint8_t *nope = rb + DS4_FP8_NOPE_OFF;
-                const __half *rope = (const __half *)(rb + DS4_FP8_ROPE_OFF);
-
-                /* Load 4 consecutive FP8 bytes per float4 via uint32 vectorized load.
-                 * Layout matches q0..q3: k_reg[lane] = dims [base*4 .. base*4+3]
-                 * where base = lane, lane+32, lane+64, lane+96. */
-                float4 k0, k1, k2, k3;
-                #pragma unroll
-                for (int reg = 0; reg < 4; reg++) {
-                    uint32_t base = (lane + reg * 32u) * 4u;
-                    float4 kv;
-                    if (base + 3u < DS4_FP8_N_NOPE) {
-                        uint32_t packed = *(const uint32_t *)(nope + base);
-                        float s = sc[base >> 6u];
-                        __nv_fp8x2_storage_t lo = (__nv_fp8x2_storage_t)(packed & 0xFFFFu);
-                        __nv_fp8x2_storage_t hi = (__nv_fp8x2_storage_t)((packed >> 16) & 0xFFFFu);
-                        __half2_raw hlo = __nv_cvt_fp8x2_to_halfraw2(lo, __NV_E4M3);
-                        __half2_raw hhi = __nv_cvt_fp8x2_to_halfraw2(hi, __NV_E4M3);
-                        kv.x = __half2float(*(__half *)&hlo.x) * s;
-                        kv.y = __half2float(*(__half *)&hlo.y) * s;
-                        kv.z = __half2float(*(__half *)&hhi.x) * s;
-                        kv.w = __half2float(*(__half *)&hhi.y) * s;
-                    } else if (base >= DS4_FP8_N_NOPE) {
-                        uint32_t ri = base - DS4_FP8_N_NOPE;
-                        kv.x = (ri < DS4_FP8_N_ROPE) ? __half2float(rope[ri]) : 0.0f;
-                        kv.y = (ri+1u < DS4_FP8_N_ROPE) ? __half2float(rope[ri+1u]) : 0.0f;
-                        kv.z = (ri+2u < DS4_FP8_N_ROPE) ? __half2float(rope[ri+2u]) : 0.0f;
-                        kv.w = (ri+3u < DS4_FP8_N_ROPE) ? __half2float(rope[ri+3u]) : 0.0f;
-                    } else {
-                        kv.x = kv.y = kv.z = kv.w = 0.0f;
-                        for (uint32_t i = 0; i < 4u; i++) {
-                            uint32_t dd = base + i;
-                            float v = (dd < DS4_FP8_N_NOPE) ? e4m3_hw_to_float(nope[dd]) * sc[dd >> 6u]
-                                    : (dd < head_dim) ? __half2float(rope[dd - DS4_FP8_N_NOPE]) : 0.0f;
-                            ((float *)&kv)[i] = v;
-                        }
-                    }
-                    if (reg == 0) k0 = kv; else if (reg == 1) k1 = kv;
-                    else if (reg == 2) k2 = kv; else k3 = kv;
-                }
-
-                o0.x=o0.x*os+k0.x*rs; o0.y=o0.y*os+k0.y*rs; o0.z=o0.z*os+k0.z*rs; o0.w=o0.w*os+k0.w*rs;
-                o1.x=o1.x*os+k1.x*rs; o1.y=o1.y*os+k1.y*rs; o1.z=o1.z*os+k1.z*rs; o1.w=o1.w*os+k1.w*rs;
-                o2.x=o2.x*os+k2.x*rs; o2.y=o2.y*os+k2.y*rs; o2.z=o2.z*os+k2.z*rs; o2.w=o2.w*os+k2.w*rs;
-                o3.x=o3.x*os+k3.x*rs; o3.y=o3.y*os+k3.y*rs; o3.z=o3.z*os+k3.z*rs; o3.w=o3.w*os+k3.w*rs;
-                max_s = new_m;
+        /* Output accumulation: cooperative shared memory load in sub-batches of 4 */
+        const uint32_t local_head = head - head_group * 8u;
+        for (uint32_t sub0 = 0; sub0 < nc; sub0 += 4u) {
+            const uint32_t nr = nc - sub0 < 4u ? nc - sub0 : 4u;
+            for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
+                const uint32_t rr = off >> 7u;
+                const uint32_t c4 = off & 127u;
+                kv_shared[off] = comp_kv_load4(comp_kv, (uint64_t)comp_rows[ci0 + sub0 + rr] * head_dim + c4 * 4);
             }
+            __syncthreads();
+            if (valid_head) {
+                for (uint32_t rr = 0; rr < nr; rr++) {
+                    float score = mma_scores[(sub0 + rr) * 8u + local_head] * attn_scale;
+                    const float4 *kv4 = kv_shared + rr * 128u;
+                    float4 k0 = kv4[lane]; float4 k1 = kv4[lane + 32u];
+                    float4 k2 = kv4[lane + 64u]; float4 k3 = kv4[lane + 96u];
+                    const float new_m = fmaxf(max_s, score);
+                    const float os = expf(max_s - new_m), rs = expf(score - new_m);
+                    sum_s = sum_s * os + rs;
+                    o0.x=o0.x*os+k0.x*rs; o0.y=o0.y*os+k0.y*rs; o0.z=o0.z*os+k0.z*rs; o0.w=o0.w*os+k0.w*rs;
+                    o1.x=o1.x*os+k1.x*rs; o1.y=o1.y*os+k1.y*rs; o1.z=o1.z*os+k1.z*rs; o1.w=o1.w*os+k1.w*rs;
+                    o2.x=o2.x*os+k2.x*rs; o2.y=o2.y*os+k2.y*rs; o2.z=o2.z*os+k2.z*rs; o2.w=o2.w*os+k2.w*rs;
+                    o3.x=o3.x*os+k3.x*rs; o3.y=o3.y*os+k3.y*rs; o3.z=o3.z*os+k3.z*rs; o3.w=o3.w*os+k3.w*rs;
+                    max_s = new_m;
+                }
+            }
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     if (valid_head) {

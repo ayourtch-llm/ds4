@@ -234,6 +234,13 @@ int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         uint32_t                rows,
         float                   eps);
 
+int ds4_gpu_f32_to_fp8_pack_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *in,
+        uint32_t              n_rows,
+        uint32_t              head_dim,
+        uint32_t              n_rot);
+
 int ds4_gpu_head_rms_norm_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_tok,

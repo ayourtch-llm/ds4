@@ -2465,6 +2465,40 @@ __device__ __forceinline__ static float comp_kv_load(const uint8_t *p, uint64_t 
 }
 
 __device__ __forceinline__ static float4 comp_kv_load4(const uint8_t *p, uint64_t base) {
+    uint32_t row = (uint32_t)(base >> 9);
+    uint32_t d = (uint32_t)(base & 511u);
+    const uint8_t *rb = p + (uint64_t)row * DS4_FP8_ROW_STRIDE;
+    if (d + 3u < DS4_FP8_N_NOPE) {
+        /* All 4 values are in the nope region — vectorized load + paired conversion */
+        uint32_t packed = *(const uint32_t *)(rb + DS4_FP8_NOPE_OFF + d);
+        __nv_fp8x2_storage_t lo2 = (__nv_fp8x2_storage_t)(packed & 0xFFFFu);
+        __nv_fp8x2_storage_t hi2 = (__nv_fp8x2_storage_t)((packed >> 16) & 0xFFFFu);
+        __half2_raw hlo = __nv_cvt_fp8x2_to_halfraw2(lo2, __NV_E4M3);
+        __half2_raw hhi = __nv_cvt_fp8x2_to_halfraw2(hi2, __NV_E4M3);
+        /* All 4 dims share the same block if they're within a 64-element block,
+         * but they might straddle a block boundary. Check cheaply: */
+        uint32_t blk0 = d >> 6;
+        uint32_t blk3 = (d + 3u) >> 6;
+        const float *scales = (const float *)(rb + DS4_FP8_SCALES_OFF);
+        if (blk0 == blk3) {
+            float s = scales[blk0];
+            return make_float4(
+                __half2float(*(__half *)&hlo.x) * s,
+                __half2float(*(__half *)&hlo.y) * s,
+                __half2float(*(__half *)&hhi.x) * s,
+                __half2float(*(__half *)&hhi.y) * s);
+        }
+        float s0 = scales[blk0];
+        float s1 = scales[(d+1u) >> 6];
+        float s2 = scales[(d+2u) >> 6];
+        float s3 = scales[blk3];
+        return make_float4(
+            __half2float(*(__half *)&hlo.x) * s0,
+            __half2float(*(__half *)&hlo.y) * s1,
+            __half2float(*(__half *)&hhi.x) * s2,
+            __half2float(*(__half *)&hhi.y) * s3);
+    }
+    /* Fallback for nope/rope boundary */
     return make_float4(comp_kv_load(p, base),
                        comp_kv_load(p, base + 1),
                        comp_kv_load(p, base + 2),

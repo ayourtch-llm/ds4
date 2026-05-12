@@ -7218,8 +7218,10 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
+            /* MMA indexed kernel is available but currently slower than scalar
+             * due to two-level loop overhead. Enable with DS4_CUDA_MMA_INDEXED=1. */
 #if DS4_CUDA_MMA_DECODE
-            if (g_cuda_sm_version >= 120 && getenv("DS4_CUDA_NO_MMA") == NULL) {
+            if (g_cuda_sm_version >= 120 && getenv("DS4_CUDA_MMA_INDEXED") != NULL) {
                 attention_indexed_mma_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                     sinks, (const float *)q->ptr, (const float *)raw_kv->ptr,
                     (const uint8_t *)comp_kv->ptr, (const int32_t *)topk->ptr,

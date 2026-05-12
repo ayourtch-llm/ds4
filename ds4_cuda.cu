@@ -2520,15 +2520,17 @@ __device__ __forceinline__ static float comp_kv_dot_strided(
     float dot = 0.0f;
 
     /* Phase 1: nope region — 7 blocks of 64, each with its own scale.
-     * Each thread handles 8 elements per block (stride 8 over 64). */
+     * Each thread handles 8 elements per block (stride 8 over 64).
+     * Scale is constant per block, so accumulate unscaled first. */
     for (uint32_t blk = 0; blk < DS4_FP8_N_BLOCKS; blk++) {
-        float s = scales[blk];
         uint32_t base = blk * DS4_FP8_BLOCK_SIZE + lane;
+        float block_dot = 0.0f;
         #pragma unroll
         for (uint32_t i = 0; i < 8u; i++) {
             uint32_t d = base + i * 8u;
-            dot += q[d] * e4m3_hw_to_float(nope[d]) * s;
+            block_dot += q[d] * e4m3_hw_to_float(nope[d]);
         }
+        dot += block_dot * scales[blk];
     }
 
     /* Phase 2: rope region — 64 fp16 values starting at dim 448.
@@ -2716,10 +2718,11 @@ __global__ static void attention_prefill_mixed_kernel(
             const __half *rope = (const __half *)(rb + DS4_FP8_ROPE_OFF);
             float dot = 0.0f;
             for (uint32_t blk = 0; blk < DS4_FP8_N_BLOCKS; blk++) {
-                float bs = sc[blk];
                 uint32_t boff = blk * DS4_FP8_BLOCK_SIZE;
+                float block_dot = 0.0f;
                 for (uint32_t i = 0; i < DS4_FP8_BLOCK_SIZE; i++)
-                    dot += qh[boff + i] * e4m3_hw_to_float(nope[boff + i]) * bs;
+                    block_dot += qh[boff + i] * e4m3_hw_to_float(nope[boff + i]);
+                dot += block_dot * sc[blk];
             }
             for (uint32_t r = 0; r < DS4_FP8_N_ROPE; r++)
                 dot += qh[DS4_FP8_N_NOPE + r] * __half2float(rope[r]);

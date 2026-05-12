@@ -4091,48 +4091,44 @@ __global__ static void attention_decode_mma_online_kernel(
                 const float os = expf(max_s - new_m), rs = expf(score - new_m);
                 sum_s = sum_s * os + rs;
 
-                /* Output accumulation: each lane reads 16 dims from FP8 KV row.
-                 * 32 lanes × 16 dims = 512 dims. Dequant in registers. */
                 const uint8_t *rb = comp_kv + (uint64_t)(comp0 + ci) * DS4_FP8_ROW_STRIDE;
                 const float *sc = (const float *)(rb + DS4_FP8_SCALES_OFF);
                 const uint8_t *nope = rb + DS4_FP8_NOPE_OFF;
                 const __half *rope = (const __half *)(rb + DS4_FP8_ROPE_OFF);
 
-                /* Nope: 448 dims, 14 values per lane (448/32) */
-                uint32_t d = lane;
-                float4 k0 = {}, k1 = {}, k2 = {}, k3 = {};
-                float *kf = (float *)&k0;
-                for (uint32_t i = 0; i < 4; i++, d += 32u) {
-                    uint32_t blk = d >> 6u;
-                    float s = sc[blk];
-                    kf[i] = e4m3_hw_to_float(nope[d]) * s;
-                }
-                kf = (float *)&k1;
-                for (uint32_t i = 0; i < 4; i++, d += 32u) {
-                    uint32_t blk = d >> 6u;
-                    float s = (d < DS4_FP8_N_NOPE) ? sc[blk] : 0.0f;
-                    kf[i] = (d < DS4_FP8_N_NOPE) ? e4m3_hw_to_float(nope[d]) * s
-                                                  : __half2float(rope[d - DS4_FP8_N_NOPE]);
-                }
-                kf = (float *)&k2;
-                for (uint32_t i = 0; i < 4; i++, d += 32u) {
-                    if (d < DS4_FP8_N_NOPE) {
-                        kf[i] = e4m3_hw_to_float(nope[d]) * sc[d >> 6u];
-                    } else if (d < head_dim) {
-                        kf[i] = __half2float(rope[d - DS4_FP8_N_NOPE]);
+                float4 k0, k1, k2, k3;
+                #pragma unroll
+                for (int reg = 0; reg < 4; reg++) {
+                    uint32_t base = (lane + reg * 32u) * 4u;
+                    float4 kv;
+                    if (base + 3u < DS4_FP8_N_NOPE) {
+                        uint32_t packed = *(const uint32_t *)(nope + base);
+                        float s = sc[base >> 6u];
+                        __nv_fp8x2_storage_t lo = (__nv_fp8x2_storage_t)(packed & 0xFFFFu);
+                        __nv_fp8x2_storage_t hi = (__nv_fp8x2_storage_t)((packed >> 16) & 0xFFFFu);
+                        __half2_raw hlo = __nv_cvt_fp8x2_to_halfraw2(lo, __NV_E4M3);
+                        __half2_raw hhi = __nv_cvt_fp8x2_to_halfraw2(hi, __NV_E4M3);
+                        kv.x = __half2float(*(__half *)&hlo.x) * s;
+                        kv.y = __half2float(*(__half *)&hlo.y) * s;
+                        kv.z = __half2float(*(__half *)&hhi.x) * s;
+                        kv.w = __half2float(*(__half *)&hhi.y) * s;
+                    } else if (base >= DS4_FP8_N_NOPE) {
+                        uint32_t ri = base - DS4_FP8_N_NOPE;
+                        kv.x = (ri < DS4_FP8_N_ROPE) ? __half2float(rope[ri]) : 0.0f;
+                        kv.y = (ri+1u < DS4_FP8_N_ROPE) ? __half2float(rope[ri+1u]) : 0.0f;
+                        kv.z = (ri+2u < DS4_FP8_N_ROPE) ? __half2float(rope[ri+2u]) : 0.0f;
+                        kv.w = (ri+3u < DS4_FP8_N_ROPE) ? __half2float(rope[ri+3u]) : 0.0f;
                     } else {
-                        kf[i] = 0.0f;
+                        kv.x = kv.y = kv.z = kv.w = 0.0f;
+                        for (uint32_t i = 0; i < 4u; i++) {
+                            uint32_t dd = base + i;
+                            float v = (dd < DS4_FP8_N_NOPE) ? e4m3_hw_to_float(nope[dd]) * sc[dd >> 6u]
+                                    : (dd < head_dim) ? __half2float(rope[dd - DS4_FP8_N_NOPE]) : 0.0f;
+                            ((float *)&kv)[i] = v;
+                        }
                     }
-                }
-                kf = (float *)&k3;
-                for (uint32_t i = 0; i < 4; i++, d += 32u) {
-                    if (d < DS4_FP8_N_NOPE) {
-                        kf[i] = e4m3_hw_to_float(nope[d]) * sc[d >> 6u];
-                    } else if (d < head_dim) {
-                        kf[i] = __half2float(rope[d - DS4_FP8_N_NOPE]);
-                    } else {
-                        kf[i] = 0.0f;
-                    }
+                    if (reg == 0) k0 = kv; else if (reg == 1) k1 = kv;
+                    else if (reg == 2) k2 = kv; else k3 = kv;
                 }
 
                 o0.x=o0.x*os+k0.x*rs; o0.y=o0.y*os+k0.y*rs; o0.z=o0.z*os+k0.z*rs; o0.w=o0.w*os+k0.w*rs;
@@ -4310,22 +4306,43 @@ __global__ static void attention_indexed_mma_online_kernel(
                 const uint8_t *nope = rb + DS4_FP8_NOPE_OFF;
                 const __half *rope = (const __half *)(rb + DS4_FP8_ROPE_OFF);
 
-                uint32_t d = lane;
-                float4 k0 = {}, k1 = {}, k2 = {}, k3 = {};
-                float *kf = (float *)&k0;
-                for (uint32_t i = 0; i < 4; i++, d += 32u) kf[i] = e4m3_hw_to_float(nope[d]) * sc[d >> 6u];
-                kf = (float *)&k1;
-                for (uint32_t i = 0; i < 4; i++, d += 32u)
-                    kf[i] = (d < DS4_FP8_N_NOPE) ? e4m3_hw_to_float(nope[d]) * sc[d >> 6u]
-                                                  : __half2float(rope[d - DS4_FP8_N_NOPE]);
-                kf = (float *)&k2;
-                for (uint32_t i = 0; i < 4; i++, d += 32u)
-                    kf[i] = (d < DS4_FP8_N_NOPE) ? e4m3_hw_to_float(nope[d]) * sc[d >> 6u]
-                            : (d < head_dim) ? __half2float(rope[d - DS4_FP8_N_NOPE]) : 0.0f;
-                kf = (float *)&k3;
-                for (uint32_t i = 0; i < 4; i++, d += 32u)
-                    kf[i] = (d < DS4_FP8_N_NOPE) ? e4m3_hw_to_float(nope[d]) * sc[d >> 6u]
-                            : (d < head_dim) ? __half2float(rope[d - DS4_FP8_N_NOPE]) : 0.0f;
+                /* Load 4 consecutive FP8 bytes per float4 via uint32 vectorized load.
+                 * Layout matches q0..q3: k_reg[lane] = dims [base*4 .. base*4+3]
+                 * where base = lane, lane+32, lane+64, lane+96. */
+                float4 k0, k1, k2, k3;
+                #pragma unroll
+                for (int reg = 0; reg < 4; reg++) {
+                    uint32_t base = (lane + reg * 32u) * 4u;
+                    float4 kv;
+                    if (base + 3u < DS4_FP8_N_NOPE) {
+                        uint32_t packed = *(const uint32_t *)(nope + base);
+                        float s = sc[base >> 6u];
+                        __nv_fp8x2_storage_t lo = (__nv_fp8x2_storage_t)(packed & 0xFFFFu);
+                        __nv_fp8x2_storage_t hi = (__nv_fp8x2_storage_t)((packed >> 16) & 0xFFFFu);
+                        __half2_raw hlo = __nv_cvt_fp8x2_to_halfraw2(lo, __NV_E4M3);
+                        __half2_raw hhi = __nv_cvt_fp8x2_to_halfraw2(hi, __NV_E4M3);
+                        kv.x = __half2float(*(__half *)&hlo.x) * s;
+                        kv.y = __half2float(*(__half *)&hlo.y) * s;
+                        kv.z = __half2float(*(__half *)&hhi.x) * s;
+                        kv.w = __half2float(*(__half *)&hhi.y) * s;
+                    } else if (base >= DS4_FP8_N_NOPE) {
+                        uint32_t ri = base - DS4_FP8_N_NOPE;
+                        kv.x = (ri < DS4_FP8_N_ROPE) ? __half2float(rope[ri]) : 0.0f;
+                        kv.y = (ri+1u < DS4_FP8_N_ROPE) ? __half2float(rope[ri+1u]) : 0.0f;
+                        kv.z = (ri+2u < DS4_FP8_N_ROPE) ? __half2float(rope[ri+2u]) : 0.0f;
+                        kv.w = (ri+3u < DS4_FP8_N_ROPE) ? __half2float(rope[ri+3u]) : 0.0f;
+                    } else {
+                        kv.x = kv.y = kv.z = kv.w = 0.0f;
+                        for (uint32_t i = 0; i < 4u; i++) {
+                            uint32_t dd = base + i;
+                            float v = (dd < DS4_FP8_N_NOPE) ? e4m3_hw_to_float(nope[dd]) * sc[dd >> 6u]
+                                    : (dd < head_dim) ? __half2float(rope[dd - DS4_FP8_N_NOPE]) : 0.0f;
+                            ((float *)&kv)[i] = v;
+                        }
+                    }
+                    if (reg == 0) k0 = kv; else if (reg == 1) k1 = kv;
+                    else if (reg == 2) k2 = kv; else k3 = kv;
+                }
 
                 o0.x=o0.x*os+k0.x*rs; o0.y=o0.y*os+k0.y*rs; o0.z=o0.z*os+k0.z*rs; o0.w=o0.w*os+k0.w*rs;
                 o1.x=o1.x*os+k1.x*rs; o1.y=o1.y*os+k1.y*rs; o1.z=o1.z*os+k1.z*rs; o1.w=o1.w*os+k1.w*rs;

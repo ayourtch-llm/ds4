@@ -124,6 +124,8 @@ static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
+static int g_q8_f16_disabled_after_oom;
+static int g_q8_f16_budget_notice_printed;
 static uint64_t g_model_load_progress_next;
 static double g_model_load_progress_last;
 static int g_model_load_progress_started;
@@ -317,9 +319,138 @@ static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, ui
     return 0;
 }
 
+static void cuda_q8_f16_cache_release_all(void) {
+    for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
+        (void)cudaFree(r.device_ptr);
+    }
+    g_q8_f16_ranges.clear();
+    g_q8_f16_by_offset.clear();
+    g_q8_f16_bytes = 0;
+}
+
+static uint64_t cuda_parse_mib_env(const char *name, int *present) {
+    const char *env = getenv(name);
+    if (present) *present = 0;
+    if (!env || !env[0]) return 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(env, &end, 10);
+    if (end == env || *end != '\0') return 0;
+    if (present) *present = 1;
+    if (v > UINT64_MAX / 1048576ull) return UINT64_MAX;
+    return (uint64_t)v * 1048576ull;
+}
+
+static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
+    int present = 0;
+    const uint64_t limit = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_MB", &present);
+    return present ? limit : UINT64_MAX;
+}
+
+static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
+    int present = 0;
+    const uint64_t reserve = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_RESERVE_MB", &present);
+    if (present) return reserve;
+
+    const uint64_t min_reserve = 4096ull * 1048576ull;
+    const uint64_t pct_reserve = total_bytes / 20u; /* 5% */
+    return pct_reserve > min_reserve ? pct_reserve : min_reserve;
+}
+
+static void cuda_q8_f16_cache_budget_notice(
+        const char *reason,
+        uint64_t request_bytes,
+        uint64_t free_bytes,
+        uint64_t total_bytes,
+        uint64_t reserve_bytes,
+        uint64_t limit_bytes) {
+    if (g_q8_f16_budget_notice_printed && getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") == NULL) return;
+    g_q8_f16_budget_notice_printed = 1;
+    if (limit_bytes != UINT64_MAX && free_bytes == 0 && total_bytes == 0 && reserve_bytes == 0) {
+        fprintf(stderr,
+                "ds4: CUDA q8 fp16 cache %s; using q8 kernels "
+                "(request=%.2f MiB cached=%.2f GiB limit=%.2f GiB)\n",
+                reason,
+                (double)request_bytes / 1048576.0,
+                (double)g_q8_f16_bytes / 1073741824.0,
+                (double)limit_bytes / 1073741824.0);
+    } else if (limit_bytes == UINT64_MAX) {
+        fprintf(stderr,
+                "ds4: CUDA q8 fp16 cache %s; using q8 kernels "
+                "(request=%.2f MiB cached=%.2f GiB free=%.2f GiB reserve=%.2f GiB total=%.2f GiB)\n",
+                reason,
+                (double)request_bytes / 1048576.0,
+                (double)g_q8_f16_bytes / 1073741824.0,
+                (double)free_bytes / 1073741824.0,
+                (double)reserve_bytes / 1073741824.0,
+                (double)total_bytes / 1073741824.0);
+    } else {
+        fprintf(stderr,
+                "ds4: CUDA q8 fp16 cache %s; using q8 kernels "
+                "(request=%.2f MiB cached=%.2f GiB limit=%.2f GiB free=%.2f GiB reserve=%.2f GiB total=%.2f GiB)\n",
+                reason,
+                (double)request_bytes / 1048576.0,
+                (double)g_q8_f16_bytes / 1073741824.0,
+                (double)limit_bytes / 1073741824.0,
+                (double)free_bytes / 1073741824.0,
+                (double)reserve_bytes / 1073741824.0,
+                (double)total_bytes / 1073741824.0);
+    }
+}
+
+static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *label) {
+    (void)label;
+    const uint64_t limit = cuda_q8_f16_cache_limit_bytes();
+    if (limit == 0) return 0;
+    if (g_q8_f16_bytes > limit || request_bytes > limit - g_q8_f16_bytes) {
+        cuda_q8_f16_cache_budget_notice("limit reached", request_bytes, 0, 0, 0, limit);
+        return 0;
+    }
+
+    size_t free_b = 0;
+    size_t total_b = 0;
+    cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA q8 fp16 cache memory query failed: %s; using q8 kernels\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    const uint64_t free_bytes = (uint64_t)free_b;
+    const uint64_t total_bytes = (uint64_t)total_b;
+    const uint64_t reserve_bytes = cuda_q8_f16_cache_reserve_bytes(total_bytes);
+    if (request_bytes > free_bytes ||
+        free_bytes - request_bytes < reserve_bytes) {
+        cuda_q8_f16_cache_budget_notice("budget exhausted", request_bytes,
+                                        free_bytes, total_bytes,
+                                        reserve_bytes, limit);
+        return 0;
+    }
+    return 1;
+}
+
+static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t request_bytes) {
+    if (!g_q8_f16_disabled_after_oom) {
+        fprintf(stderr,
+                "ds4: CUDA q8 fp16 cache disabled after %s "
+                "(request=%.2f MiB cached=%.2f GiB); using q8 kernels\n",
+                what ? what : "allocation failure",
+                (double)request_bytes / 1048576.0,
+                (double)g_q8_f16_bytes / 1073741824.0);
+    }
+    g_q8_f16_disabled_after_oom = 1;
+    if (!g_q8_f16_ranges.empty()) {
+        (void)cudaDeviceSynchronize();
+        cuda_q8_f16_cache_release_all();
+    }
+    (void)cudaGetLastError();
+}
+
 static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (g_quality_mode) return 0;
+    if (g_q8_f16_disabled_after_oom) return 0;
     if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
+    if (cuda_q8_f16_cache_limit_bytes() == 0) return 0;
     if (getenv("DS4_CUDA_Q8_F16_ALL") != NULL) return 1;
     if (!label) return 0;
     if (strstr(label, "attn_output_a") != NULL ||
@@ -395,13 +526,16 @@ static const __half *cuda_q8_f16_ptr(
     const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
     if (!q8) return NULL;
 
+    if (in_dim != 0 && out_dim > UINT64_MAX / in_dim / sizeof(__half)) return NULL;
     const uint64_t out_bytes = in_dim * out_dim * sizeof(__half);
+    if (!cuda_q8_f16_cache_has_budget(out_bytes, label)) return NULL;
+
     __half *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA q8 fp16 cache alloc failed (%.2f MiB): %s\n",
                 (double)out_bytes / 1048576.0, cudaGetErrorString(err));
-        (void)cudaGetLastError();
+        cuda_q8_f16_cache_disable_after_failure("allocation failure", out_bytes);
         return NULL;
     }
     const uint64_t blocks = (in_dim + 31) / 32;
@@ -413,6 +547,7 @@ static const __half *cuda_q8_f16_ptr(
                                                           blocks);
     if (!cuda_ok(cudaGetLastError(), "q8 fp16 dequant launch")) {
         (void)cudaFree(dev);
+        cuda_q8_f16_cache_disable_after_failure("dequant launch failure", out_bytes);
         return NULL;
     }
     g_q8_f16_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
@@ -1077,12 +1212,9 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cublas = NULL;
     }
     cuda_model_range_release_all();
-    for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
-        (void)cudaFree(r.device_ptr);
-    }
-    g_q8_f16_ranges.clear();
-    g_q8_f16_by_offset.clear();
-    g_q8_f16_bytes = 0;
+    cuda_q8_f16_cache_release_all();
+    g_q8_f16_disabled_after_oom = 0;
+    g_q8_f16_budget_notice_printed = 0;
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
         (void)cudaFree(r.device_ptr);
     }
@@ -1210,12 +1342,9 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
     cuda_model_range_release_all();
-    for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
-        (void)cudaFree(r.device_ptr);
-    }
-    g_q8_f16_ranges.clear();
-    g_q8_f16_by_offset.clear();
-    g_q8_f16_bytes = 0;
+    cuda_q8_f16_cache_release_all();
+    g_q8_f16_disabled_after_oom = 0;
+    g_q8_f16_budget_notice_printed = 0;
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
         (void)cudaFree(r.device_ptr);
     }
@@ -2280,22 +2409,28 @@ __device__ __forceinline__ static uint8_t float_to_e4m3_byte(float v) {
     return (uint8_t)(sign | ((uint32_t)exp_e4 << 3) | man);
 }
 
-__device__ __forceinline__ static float comp_kv_load(const uint8_t *p, uint64_t idx) {
+__device__ __forceinline__ static void e4m3_lut_init(float *lut) {
+    if (threadIdx.x < 256u)
+        lut[threadIdx.x] = e4m3_byte_to_float((uint8_t)threadIdx.x);
+    __syncthreads();
+}
+
+__device__ __forceinline__ static float comp_kv_load(const float *e4m3_lut, const uint8_t *p, uint64_t idx) {
     uint32_t row = (uint32_t)(idx >> 9);
     uint32_t d = (uint32_t)(idx & 511u);
     const uint8_t *rb = p + (uint64_t)row * DS4_FP8_ROW_STRIDE;
     if (d < DS4_FP8_N_NOPE) {
         float scale = ((const float *)(rb + DS4_FP8_SCALES_OFF))[d >> 6];
-        return e4m3_byte_to_float(rb[DS4_FP8_NOPE_OFF + d]) * scale;
+        return e4m3_lut[rb[DS4_FP8_NOPE_OFF + d]] * scale;
     }
     return __half2float(((const __half *)(rb + DS4_FP8_ROPE_OFF))[d - DS4_FP8_N_NOPE]);
 }
 
-__device__ __forceinline__ static float4 comp_kv_load4(const uint8_t *p, uint64_t base) {
-    return make_float4(comp_kv_load(p, base),
-                       comp_kv_load(p, base + 1),
-                       comp_kv_load(p, base + 2),
-                       comp_kv_load(p, base + 3));
+__device__ __forceinline__ static float4 comp_kv_load4(const float *e4m3_lut, const uint8_t *p, uint64_t base) {
+    return make_float4(comp_kv_load(e4m3_lut, p, base),
+                       comp_kv_load(e4m3_lut, p, base + 1),
+                       comp_kv_load(e4m3_lut, p, base + 2),
+                       comp_kv_load(e4m3_lut, p, base + 3));
 }
 
 __global__ static void f32_to_fp8_pack_kernel(uint8_t *out, const float *in, uint32_t n_rows,
@@ -2443,10 +2578,12 @@ __global__ static void attention_prefill_mixed_kernel(
     uint32_t raw_count = t + 1u - raw_start;
     uint32_t visible_comp = (t + 1u) / ratio;
     if (visible_comp > n_comp) visible_comp = n_comp;
+    __shared__ float e4m3_lut[256];
     __shared__ float scores[512];
     __shared__ float partial[256];
     __shared__ float max_s;
     __shared__ float denom;
+    e4m3_lut_init(e4m3_lut);
     float scale = rsqrtf((float)head_dim);
     float local_max = sinks[h];
     uint32_t n_score = raw_count + visible_comp;
@@ -2463,7 +2600,7 @@ __global__ static void attention_prefill_mixed_kernel(
         float s = -INFINITY;
         if (add > -1.0e20f) {
             float dot = 0.0f;
-            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * comp_kv_load(comp_kv, (uint64_t)c * head_dim + d);
+            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * comp_kv_load(e4m3_lut, comp_kv, (uint64_t)c * head_dim + d);
             s = dot * scale + add;
         }
         scores[raw_count + c] = s;
@@ -2494,7 +2631,7 @@ __global__ static void attention_prefill_mixed_kernel(
     for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)(raw_start + r) * head_dim + d] * scores[r];
-        for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv_load(comp_kv, (uint64_t)c * head_dim + d) * scores[raw_count + c];
+        for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv_load(e4m3_lut, comp_kv, (uint64_t)c * head_dim + d) * scores[raw_count + c];
         oh[d] = acc / denom;
     }
 }
@@ -2609,13 +2746,15 @@ __global__ static void attention_prefill_pack_mixed_kv_kernel(
         uint32_t n_tokens,
         uint32_t n_comp,
         uint32_t head_dim) {
+    __shared__ float e4m3_lut[256];
+    e4m3_lut_init(e4m3_lut);
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)(n_tokens + n_comp) * head_dim;
     if (gid >= n) return;
     uint32_t d = gid % head_dim;
     uint32_t r = gid / head_dim;
     dst[gid] = r < n_tokens ? raw_kv[(uint64_t)r * head_dim + d]
-                             : comp_kv_load(comp_kv, (uint64_t)(r - n_tokens) * head_dim + d);
+                             : comp_kv_load(e4m3_lut, comp_kv, (uint64_t)(r - n_tokens) * head_dim + d);
 }
 
 __global__ static void attention_prefill_unpack_heads_kernel(
@@ -2694,9 +2833,11 @@ __global__ static void attention_decode_mixed_kernel(
     uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
     if (visible_comp > n_comp) visible_comp = n_comp;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    __shared__ float e4m3_lut[256];
     __shared__ float scores[DS4_CUDA_ATTENTION_SCORE_CAP];
     __shared__ uint32_t raw_rows[256];
     __shared__ float partial[256];
+    e4m3_lut_init(e4m3_lut);
     __shared__ float max_s;
     __shared__ float denom;
     __shared__ uint32_t raw_count;
@@ -2744,7 +2885,7 @@ __global__ static void attention_decode_mixed_kernel(
             float s = -INFINITY;
             if (add > -1.0e20f) {
                     float dot = 0.0f;
-                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * comp_kv_load(comp_kv, (uint64_t)c * head_dim + d);
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * comp_kv_load(e4m3_lut, comp_kv, (uint64_t)c * head_dim + d);
                 s = dot * scale + add;
             }
             scores[raw_count + c] = s;
@@ -2771,7 +2912,7 @@ __global__ static void attention_decode_mixed_kernel(
                     float add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
                     if (add > -1.0e20f) {
                         float dot = 0.0f;
-                        for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * comp_kv_load(comp_kv, (uint64_t)c * head_dim + d);
+                        for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * comp_kv_load(e4m3_lut, comp_kv, (uint64_t)c * head_dim + d);
                         const uint32_t mask = 0xffu << (threadIdx.x & 24u);
                         for (uint32_t off = 4u; off > 0u; off >>= 1u) {
                             dot += __shfl_down_sync(mask, dot, off, 8);
@@ -2822,8 +2963,8 @@ __global__ static void attention_decode_mixed_kernel(
         }
         for (uint32_t c = 0; c < visible_comp; c++) {
             float s = scores[raw_count + c];
-            acc0 += comp_kv_load(comp_kv, (uint64_t)c * head_dim + d0) * s;
-            acc1 += comp_kv_load(comp_kv, (uint64_t)c * head_dim + d1) * s;
+            acc0 += comp_kv_load(e4m3_lut, comp_kv, (uint64_t)c * head_dim + d0) * s;
+            acc1 += comp_kv_load(e4m3_lut, comp_kv, (uint64_t)c * head_dim + d1) * s;
         }
         oh[d0] = acc0 / denom;
         oh[d1] = acc1 / denom;
@@ -2831,7 +2972,7 @@ __global__ static void attention_decode_mixed_kernel(
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
             float acc = 0.0f;
             for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)raw_rows[r] * head_dim + d] * scores[r];
-            for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv_load(comp_kv, (uint64_t)c * head_dim + d) * scores[raw_count + c];
+            for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv_load(e4m3_lut, comp_kv, (uint64_t)c * head_dim + d) * scores[raw_count + c];
             oh[d] = acc / denom;
         }
     }
@@ -2866,11 +3007,13 @@ __global__ static void attention_indexed_mixed_kernel(
         if (visible_comp > n_comp) visible_comp = n_comp;
     }
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    __shared__ float e4m3_lut[256];
     __shared__ float scores[768];
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t comp_rows[512];
     __shared__ float partial[256];
     __shared__ float max_s;
+    e4m3_lut_init(e4m3_lut);
     __shared__ float denom;
     __shared__ uint32_t raw_count;
     __shared__ uint32_t raw_first_idx;
@@ -2935,7 +3078,7 @@ __global__ static void attention_indexed_mixed_kernel(
                     for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
                 } else {
                     uint64_t comp_base = (uint64_t)comp_rows[row - raw_count] * head_dim;
-                    for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * comp_kv_load(comp_kv, comp_base + d);
+                    for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * comp_kv_load(e4m3_lut, comp_kv, comp_base + d);
                 }
                 const uint32_t mask = 0xffu << (threadIdx.x & 24u);
                 for (uint32_t off = 4u; off > 0u; off >>= 1u) {
@@ -2984,8 +3127,8 @@ __global__ static void attention_indexed_mixed_kernel(
         }
         for (uint32_t c = 0; c < comp_count; c++) {
             float s = scores[raw_count + c];
-            acc0 += comp_kv_load(comp_kv, (uint64_t)comp_rows[c] * head_dim + d0) * s;
-            acc1 += comp_kv_load(comp_kv, (uint64_t)comp_rows[c] * head_dim + d1) * s;
+            acc0 += comp_kv_load(e4m3_lut, comp_kv, (uint64_t)comp_rows[c] * head_dim + d0) * s;
+            acc1 += comp_kv_load(e4m3_lut, comp_kv, (uint64_t)comp_rows[c] * head_dim + d1) * s;
         }
         oh[d0] = acc0 / denom;
         oh[d1] = acc1 / denom;
@@ -2993,7 +3136,7 @@ __global__ static void attention_indexed_mixed_kernel(
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
             float acc = 0.0f;
             for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)raw_rows[r] * head_dim + d] * scores[r];
-            for (uint32_t s = 0; s < comp_count; s++) acc += comp_kv_load(comp_kv, (uint64_t)comp_rows[s] * head_dim + d) * scores[raw_count + s];
+            for (uint32_t s = 0; s < comp_count; s++) acc += comp_kv_load(e4m3_lut, comp_kv, (uint64_t)comp_rows[s] * head_dim + d) * scores[raw_count + s];
             oh[d] = acc / denom;
         }
     }
@@ -3025,6 +3168,8 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
     const uint32_t head = head_group * 8u + warp;
     const bool valid_head = head < n_head;
 
+    __shared__ float e4m3_lut[256];
+    e4m3_lut_init(e4m3_lut);
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t comp_rows[512];
     __shared__ uint32_t raw_count;
@@ -3098,7 +3243,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
                 const float4 *src = (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim);
                 kv_shared[off] = src[c4];
             } else {
-                kv_shared[off] = comp_kv_load4(comp_kv, (uint64_t)comp_rows[sr - raw_count] * head_dim + c4 * 4);
+                kv_shared[off] = comp_kv_load4(e4m3_lut, comp_kv, (uint64_t)comp_rows[sr - raw_count] * head_dim + c4 * 4);
             }
         }
         __syncthreads();
@@ -3148,7 +3293,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
                 const float4 *src = (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim);
                 kv_shared[off] = src[c4];
             } else {
-                kv_shared[off] = comp_kv_load4(comp_kv, (uint64_t)comp_rows[sr - raw_count] * head_dim + c4 * 4);
+                kv_shared[off] = comp_kv_load4(e4m3_lut, comp_kv, (uint64_t)comp_rows[sr - raw_count] * head_dim + c4 * 4);
             }
         }
         __syncthreads();
@@ -3204,6 +3349,8 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     const uint32_t head = head_group * 8u + warp;
     const bool valid_head = head < n_head;
 
+    __shared__ float e4m3_lut[256];
+    e4m3_lut_init(e4m3_lut);
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t comp_rows[512];
     __shared__ uint32_t raw_count;
@@ -3281,7 +3428,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
                 const float4 *src = (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim);
                 kv_shared[off] = src[c4];
             } else {
-                kv_shared[off] = comp_kv_load4(comp_kv, (uint64_t)comp_rows[sr - raw_count] * head_dim + c4 * 4);
+                kv_shared[off] = comp_kv_load4(e4m3_lut, comp_kv, (uint64_t)comp_rows[sr - raw_count] * head_dim + c4 * 4);
             }
         }
         __syncthreads();
@@ -3369,7 +3516,9 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
     const uint32_t head = head_group * 8u + warp;
     const bool valid_head = head < n_head;
 
+    __shared__ float e4m3_lut[256];
     __shared__ float4 kv_shared[4 * 128];
+    e4m3_lut_init(e4m3_lut);
 
     const uint32_t raw_count = window != 0u && t + 1u > window ? window : t + 1u;
     const uint32_t raw_start = t + 1u - raw_count;
@@ -3407,7 +3556,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
                 const float4 *src = (const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim);
                 kv_shared[off] = src[c4];
             } else {
-                kv_shared[off] = comp_kv_load4(comp_kv, (uint64_t)(sr - raw_count) * head_dim + c4 * 4);
+                kv_shared[off] = comp_kv_load4(e4m3_lut, comp_kv, (uint64_t)(sr - raw_count) * head_dim + c4 * 4);
             }
         }
         __syncthreads();
@@ -3499,10 +3648,12 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     const uint32_t head = head_group * 8u + warp;
     const bool valid_head = head < n_head;
 
+    __shared__ float e4m3_lut[256];
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t raw_count_s;
     __shared__ uint32_t raw_first_idx_s;
     __shared__ float4 kv_shared[4 * 128];
+    e4m3_lut_init(e4m3_lut);
 
     const uint32_t qpos = pos0 + t;
     const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
@@ -3574,7 +3725,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
                 const float4 *src = (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim);
                 kv_shared[off] = src[c4];
             } else {
-                kv_shared[off] = comp_kv_load4(comp_kv, (uint64_t)(sr - raw_count) * head_dim + c4 * 4);
+                kv_shared[off] = comp_kv_load4(e4m3_lut, comp_kv, (uint64_t)(sr - raw_count) * head_dim + c4 * 4);
             }
         }
         __syncthreads();

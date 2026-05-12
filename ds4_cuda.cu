@@ -3962,13 +3962,6 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     __shared__ uint32_t raw_count_s;
     __shared__ uint32_t raw_first_idx_s;
     __shared__ float4 kv_shared[4 * 128];
-#if __CUDA_ARCH__ >= 1200
-    /* MMA pre-computed scores for compressed KV rows.
-     * Filled by warp 0 in batches of 16 before the main loop. */
-    __shared__ float mma_comp_scores[16 * 8]; /* 16 rows × 8 heads */
-    __shared__ uint32_t mma_batch_start;
-    __shared__ uint32_t mma_batch_count;
-#endif
 
 
     const uint32_t qpos = pos0 + t;
@@ -4031,14 +4024,18 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 o1 = o0, o2 = o0, o3 = o0;
 
-    /* Process raw KV rows first (float32, original path) */
-    for (uint32_t row0 = 0; row0 < raw_count; row0 += 4u) {
-        const uint32_t nr = raw_count - row0 < 4u ? raw_count - row0 : 4u;
+    for (uint32_t row0 = 0; row0 < n_score; row0 += 4u) {
+        const uint32_t nr = n_score - row0 < 4u ? n_score - row0 : 4u;
         for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
-            const float4 *src = (const float4 *)(raw_kv + (uint64_t)raw_rows[row0 + rr] * head_dim);
-            kv_shared[off] = src[c4];
+            const uint32_t sr = row0 + rr;
+            if (sr < raw_count) {
+                const float4 *src = (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim);
+                kv_shared[off] = src[c4];
+            } else {
+                kv_shared[off] = comp_kv_load4(comp_kv, (uint64_t)(sr - raw_count) * head_dim + c4 * 4);
+            }
         }
         __syncthreads();
         if (valid_head) {
@@ -4048,112 +4045,38 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
                 float4 k1 = kv4[lane + 32u];
                 float4 k2 = kv4[lane + 64u];
                 float4 k3 = kv4[lane + 96u];
-                float score = dot4_f32(q0, k0) + dot4_f32(q1, k1) +
-                              dot4_f32(q2, k2) + dot4_f32(q3, k3);
+                float score = dot4_f32(q0, k0) +
+                              dot4_f32(q1, k1) +
+                              dot4_f32(q2, k2) +
+                              dot4_f32(q3, k3);
                 score = warp_sum_f32(score) * scale;
                 score = __shfl_sync(0xffffffffu, score, 0);
+
                 const float new_m = fmaxf(max_s, score);
-                const float old_scale_f = expf(max_s - new_m);
-                const float row_scale_f = expf(score - new_m);
-                sum_s = sum_s * old_scale_f + row_scale_f;
-                o0.x = o0.x*old_scale_f + k0.x*row_scale_f; o0.y = o0.y*old_scale_f + k0.y*row_scale_f;
-                o0.z = o0.z*old_scale_f + k0.z*row_scale_f; o0.w = o0.w*old_scale_f + k0.w*row_scale_f;
-                o1.x = o1.x*old_scale_f + k1.x*row_scale_f; o1.y = o1.y*old_scale_f + k1.y*row_scale_f;
-                o1.z = o1.z*old_scale_f + k1.z*row_scale_f; o1.w = o1.w*old_scale_f + k1.w*row_scale_f;
-                o2.x = o2.x*old_scale_f + k2.x*row_scale_f; o2.y = o2.y*old_scale_f + k2.y*row_scale_f;
-                o2.z = o2.z*old_scale_f + k2.z*row_scale_f; o2.w = o2.w*old_scale_f + k2.w*row_scale_f;
-                o3.x = o3.x*old_scale_f + k3.x*row_scale_f; o3.y = o3.y*old_scale_f + k3.y*row_scale_f;
-                o3.z = o3.z*old_scale_f + k3.z*row_scale_f; o3.w = o3.w*old_scale_f + k3.w*row_scale_f;
+                const float old_scale = expf(max_s - new_m);
+                const float row_scale = expf(score - new_m);
+                sum_s = sum_s * old_scale + row_scale;
+                o0.x = o0.x * old_scale + k0.x * row_scale;
+                o0.y = o0.y * old_scale + k0.y * row_scale;
+                o0.z = o0.z * old_scale + k0.z * row_scale;
+                o0.w = o0.w * old_scale + k0.w * row_scale;
+                o1.x = o1.x * old_scale + k1.x * row_scale;
+                o1.y = o1.y * old_scale + k1.y * row_scale;
+                o1.z = o1.z * old_scale + k1.z * row_scale;
+                o1.w = o1.w * old_scale + k1.w * row_scale;
+                o2.x = o2.x * old_scale + k2.x * row_scale;
+                o2.y = o2.y * old_scale + k2.y * row_scale;
+                o2.z = o2.z * old_scale + k2.z * row_scale;
+                o2.w = o2.w * old_scale + k2.w * row_scale;
+                o3.x = o3.x * old_scale + k3.x * row_scale;
+                o3.y = o3.y * old_scale + k3.y * row_scale;
+                o3.z = o3.z * old_scale + k3.z * row_scale;
+                o3.w = o3.w * old_scale + k3.w * row_scale;
                 max_s = new_m;
             }
         }
         __syncthreads();
     }
-
-    /* Process compressed KV rows: MMA for scores, shared mem for output accum */
-#if __CUDA_ARCH__ >= 1200
-    for (uint32_t comp0 = 0; comp0 < comp_count; comp0 += 16u) {
-        const uint32_t nc = comp_count - comp0 < 16u ? comp_count - comp0 : 16u;
-
-        /* Warp 0: compute MMA scores for 16 comp rows × 8 heads */
-        if (warp == 0u) {
-            const float *q_base = q + (uint64_t)t * n_head * head_dim;
-            const float *q_heads_arr[8];
-            for (int hh = 0; hh < 8; hh++)
-                q_heads_arr[hh] = q_base + (uint64_t)(head_group * 8u + hh) * head_dim;
-            comp_kv_mma_scores_16x8(comp_kv, comp0, nc, q_heads_arr, mma_comp_scores);
-        }
-        __syncthreads();
-
-        /* All warps: load comp KV into shared mem and do online softmax */
-        for (uint32_t ci = 0; ci < nc; ci++) {
-            for (uint32_t off = threadIdx.x; off < 128u; off += blockDim.x) {
-                kv_shared[off] = comp_kv_load4(comp_kv, (uint64_t)(comp0 + ci) * head_dim + off * 4);
-            }
-            __syncthreads();
-            if (valid_head) {
-                float4 k0 = kv_shared[lane +  0u];
-                float4 k1 = kv_shared[lane + 32u];
-                float4 k2 = kv_shared[lane + 64u];
-                float4 k3 = kv_shared[lane + 96u];
-                /* Read MMA-precomputed score for this (row, head) */
-                uint32_t local_head = head - head_group * 8u;
-                float score = mma_comp_scores[ci * 8u + local_head] * scale;
-
-                const float new_m = fmaxf(max_s, score);
-                const float old_scale_f = expf(max_s - new_m);
-                const float row_scale_f = expf(score - new_m);
-                sum_s = sum_s * old_scale_f + row_scale_f;
-                o0.x = o0.x*old_scale_f + k0.x*row_scale_f; o0.y = o0.y*old_scale_f + k0.y*row_scale_f;
-                o0.z = o0.z*old_scale_f + k0.z*row_scale_f; o0.w = o0.w*old_scale_f + k0.w*row_scale_f;
-                o1.x = o1.x*old_scale_f + k1.x*row_scale_f; o1.y = o1.y*old_scale_f + k1.y*row_scale_f;
-                o1.z = o1.z*old_scale_f + k1.z*row_scale_f; o1.w = o1.w*old_scale_f + k1.w*row_scale_f;
-                o2.x = o2.x*old_scale_f + k2.x*row_scale_f; o2.y = o2.y*old_scale_f + k2.y*row_scale_f;
-                o2.z = o2.z*old_scale_f + k2.z*row_scale_f; o2.w = o2.w*old_scale_f + k2.w*row_scale_f;
-                o3.x = o3.x*old_scale_f + k3.x*row_scale_f; o3.y = o3.y*old_scale_f + k3.y*row_scale_f;
-                o3.z = o3.z*old_scale_f + k3.z*row_scale_f; o3.w = o3.w*old_scale_f + k3.w*row_scale_f;
-                max_s = new_m;
-            }
-            __syncthreads();
-        }
-    }
-#else
-    /* Fallback: original comp KV path for non-Blackwell */
-    for (uint32_t comp0 = 0; comp0 < comp_count; comp0 += 4u) {
-        const uint32_t nr = comp_count - comp0 < 4u ? comp_count - comp0 : 4u;
-        for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
-            const uint32_t rr = off >> 7u;
-            const uint32_t c4 = off & 127u;
-            kv_shared[off] = comp_kv_load4(comp_kv, (uint64_t)(comp0 + rr) * head_dim + c4 * 4);
-        }
-        __syncthreads();
-        if (valid_head) {
-            for (uint32_t rr = 0; rr < nr; rr++) {
-                const float4 *kv4 = kv_shared + rr * 128u;
-                float4 k0 = kv4[lane +  0u]; float4 k1 = kv4[lane + 32u];
-                float4 k2 = kv4[lane + 64u]; float4 k3 = kv4[lane + 96u];
-                float score = dot4_f32(q0, k0) + dot4_f32(q1, k1) +
-                              dot4_f32(q2, k2) + dot4_f32(q3, k3);
-                score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(0xffffffffu, score, 0);
-                const float new_m = fmaxf(max_s, score);
-                const float old_scale_f = expf(max_s - new_m);
-                const float row_scale_f = expf(score - new_m);
-                sum_s = sum_s * old_scale_f + row_scale_f;
-                o0.x = o0.x*old_scale_f + k0.x*row_scale_f; o0.y = o0.y*old_scale_f + k0.y*row_scale_f;
-                o0.z = o0.z*old_scale_f + k0.z*row_scale_f; o0.w = o0.w*old_scale_f + k0.w*row_scale_f;
-                o1.x = o1.x*old_scale_f + k1.x*row_scale_f; o1.y = o1.y*old_scale_f + k1.y*row_scale_f;
-                o1.z = o1.z*old_scale_f + k1.z*row_scale_f; o1.w = o1.w*old_scale_f + k1.w*row_scale_f;
-                o2.x = o2.x*old_scale_f + k2.x*row_scale_f; o2.y = o2.y*old_scale_f + k2.y*row_scale_f;
-                o2.z = o2.z*old_scale_f + k2.z*row_scale_f; o2.w = o2.w*old_scale_f + k2.w*row_scale_f;
-                o3.x = o3.x*old_scale_f + k3.x*row_scale_f; o3.y = o3.y*old_scale_f + k3.y*row_scale_f;
-                o3.z = o3.z*old_scale_f + k3.z*row_scale_f; o3.w = o3.w*old_scale_f + k3.w*row_scale_f;
-                max_s = new_m;
-            }
-        }
-        __syncthreads();
-    }
-#endif
 
     if (valid_head) {
         const float sink = sinks[head];

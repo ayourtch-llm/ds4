@@ -1629,9 +1629,35 @@ static float dsv4_e4m3fn_dequant_cpu(float x) {
     return sign * dsv4_e4m3fn_value_cpu(best);
 }
 
-/* DeepSeek V4 stores the non-RoPE part of compressed KV through an E4M3-style
- * round trip.  Keeping this in the CPU reference makes cache values comparable
- * to the Metal graph's compressed-cache behavior. */
+static float e4m3_byte_to_float_cpu(uint8_t v) {
+    float sign = (v & 0x80u) ? -1.0f : 1.0f;
+    return sign * dsv4_e4m3fn_value_cpu(v & 0x7fu);
+}
+
+enum {
+    DS4_FP8_N_NOPE_CPU    = 448u,
+    DS4_FP8_N_ROPE_CPU    = 64u,
+    DS4_FP8_N_BLOCKS_CPU  = 7u,
+    DS4_FP8_SCALES_OFF_CPU= 0u,
+    DS4_FP8_NOPE_OFF_CPU  = 32u,
+    DS4_FP8_ROPE_OFF_CPU  = 480u,
+    DS4_FP8_ROW_STRIDE_CPU= 640u
+};
+
+static void comp_kv_unpack_row_cpu(float *out, const uint8_t *row, uint32_t head_dim) {
+    const uint32_t n_nope = head_dim - DS4_FP8_N_ROPE_CPU;
+    const float *scales = (const float *)(row + DS4_FP8_SCALES_OFF_CPU);
+    const uint8_t *nope = row + DS4_FP8_NOPE_OFF_CPU;
+    const uint16_t *rope = (const uint16_t *)(row + DS4_FP8_ROPE_OFF_CPU);
+    for (uint32_t d = 0; d < n_nope; d++) {
+        float scale = scales[d >> 6];
+        out[d] = e4m3_byte_to_float_cpu(nope[d]) * scale;
+    }
+    for (uint32_t d = 0; d < DS4_FP8_N_ROPE_CPU; d++) {
+        out[n_nope + d] = f16_to_f32(rope[d]);
+    }
+}
+
 static void dsv4_fp8_kv_quantize_row_inplace_cpu(float *x, uint32_t head_dim, uint32_t n_rot) {
     const uint32_t n_nope = head_dim - n_rot;
     for (uint32_t off = 0; off < n_nope; off += 64) {
@@ -13974,16 +14000,23 @@ static int metal_graph_prompt_logits_test(
 
                 const uint32_t n_comp = cpu_cache.layer[il].n_comp;
                 if (n_comp == 0) continue;
-                const uint64_t n = (uint64_t)n_comp * DS4_N_HEAD_DIM;
-                float *gpu_comp = xmalloc((size_t)n * sizeof(float));
-                if (ds4_gpu_tensor_read(g.layer_attn_comp_cache[il], 0, gpu_comp, n * sizeof(float)) != 0) {
+                const uint64_t packed_bytes = (uint64_t)n_comp * DS4_FP8_ROW_STRIDE_CPU;
+                uint8_t *gpu_packed = xmalloc((size_t)packed_bytes);
+                if (ds4_gpu_tensor_read(g.layer_attn_comp_cache[il], 0, gpu_packed, packed_bytes) != 0) {
+                    const uint64_t n = (uint64_t)n_comp * DS4_N_HEAD_DIM;
+                    float *gpu_comp = xmalloc((size_t)n * sizeof(float));
+                    for (uint32_t r = 0; r < n_comp; r++)
+                        comp_kv_unpack_row_cpu(gpu_comp + (uint64_t)r * DS4_N_HEAD_DIM,
+                                               gpu_packed + (uint64_t)r * DS4_FP8_ROW_STRIDE_CPU,
+                                               DS4_N_HEAD_DIM);
                     fprintf(stderr,
                             "ds4: comp trace layer %u n=%u attn_max=%g attn_rms=%g\n",
                             il, n_comp,
                             max_abs_diff(cpu_cache.layer[il].attn_comp_kv, gpu_comp, n),
                             rms_abs_diff(cpu_cache.layer[il].attn_comp_kv, gpu_comp, n));
+                    free(gpu_comp);
                 }
-                free(gpu_comp);
+                free(gpu_packed);
 
                 const uint32_t n_index = cpu_cache.layer[il].n_index_comp;
                 if (n_index != 0 && g.layer_index_comp_cache[il]) {

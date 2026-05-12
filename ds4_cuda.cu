@@ -2699,52 +2699,31 @@ __device__ static void comp_kv_mma_scores_16x8(
         d3 += p3 * s_bot;
     }
 
-    /* d0..d3 now hold scaled nope dot products for 16 rows × 8 heads.
-     * D layout: d0 = scores[gid, tid*2], d1 = scores[gid, tid*2+1]
-     *           d2 = scores[gid+8, tid*2], d3 = scores[gid+8, tid*2+1]
-     *
-     * Add rope contribution: 64 fp16 dims, same Q for all rows.
-     * Each thread computes rope dot for 2 rows (gid, gid+8) × 2 heads (tid*2, tid*2+1).
-     * With 32 lanes, each handles 2 rope dims (64/32). */
+    /* Add rope contribution: 64 fp16 dims.
+     * MMA layout: lanes with the same gid share the same output row.
+     * 4 consecutive lanes (gid*4 .. gid*4+3) have tid=0..3, covering
+     * heads (0,1), (2,3), (4,5), (6,7). Each thread computes the full
+     * 64-dim rope dot product for its own 2 heads — no reduction needed. */
     {
-        /* Rope dot for 2 heads this thread is responsible for */
         const float *qr0 = q_heads[tid * 2u] + DS4_FP8_N_NOPE;
         const float *qr1 = q_heads[tid * 2u + 1u] + DS4_FP8_N_NOPE;
 
-        /* Top row (gid) and bottom row (gid+8) */
+        #pragma unroll
         for (int rh = 0; rh < 2; rh++) {
             uint32_t r = gid + rh * 8u;
             if (r >= n_rows) continue;
             const __half *rope = (const __half *)(
                 comp_kv + (uint64_t)(row_start + r) * DS4_FP8_ROW_STRIDE + DS4_FP8_ROPE_OFF);
             float rdot0 = 0.0f, rdot1 = 0.0f;
-            /* Each lane handles 2 rope dims */
-            uint32_t rd = lane * 2u;
-            if (rd < DS4_FP8_N_ROPE) {
-                float rv0 = __half2float(rope[rd]);
-                float rv1 = __half2float(rope[rd + 1u]);
-                rdot0 = qr0[rd] * rv0 + qr0[rd + 1u] * rv1;
-                rdot1 = qr1[rd] * rv0 + qr1[rd + 1u] * rv1;
+            #pragma unroll
+            for (uint32_t d = 0; d < DS4_FP8_N_ROPE; d++) {
+                float rv = __half2float(rope[d]);
+                rdot0 += qr0[d] * rv;
+                rdot1 += qr1[d] * rv;
             }
-            /* Warp reduction */
-            for (uint32_t off = 16u; off > 0u; off >>= 1u) {
-                rdot0 += __shfl_down_sync(0xffffffffu, rdot0, off);
-                rdot1 += __shfl_down_sync(0xffffffffu, rdot1, off);
-            }
-            /* Lane 0 has the sum — broadcast to the lanes that own d0..d3.
-             * d0 = scores[gid, tid*2], but rope sum is for heads tid*2, tid*2+1.
-             * We need to add rope[row][head] to the correct d register.
-             * Problem: each lane's d0 is for a different head pair (tid*2).
-             * The rope sum for head h is only correct on lane 0 after reduction.
-             * We need to distribute it. */
-            /* Broadcast rope sums for all 8 heads via shared memory or shuffle.
-             * Since each thread needs rope for its own 2 heads (tid*2, tid*2+1),
-             * we need to reduce rope per head, not per thread. This requires
-             * restructuring. For now, use a shared memory broadcast. */
+            if (rh == 0) { d0 += rdot0; d1 += rdot1; }
+            else         { d2 += rdot0; d3 += rdot1; }
         }
-        /* TODO: The rope reduction across heads is complex with the MMA layout.
-         * Skipping rope for the initial benchmark — nope covers 448/512 = 87.5%
-         * of the dot product, so the MMA result is a good approximation. */
     }
 
     /* Store scores — each thread writes its 4 output elements.

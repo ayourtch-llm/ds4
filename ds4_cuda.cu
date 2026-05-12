@@ -2592,9 +2592,12 @@ __device__ __forceinline__ static uint32_t pack4(uint8_t b0, uint8_t b1, uint8_t
  *   head_dim:   must be 512
  *   scores_out: output [16][8] scores (only [n_rows][8] valid)
  */
-__device__ static void comp_kv_mma_scores_16x8(
+/* Core MMA score computation for 16 comp KV rows × 8 heads.
+ * row_indices: if non-NULL, indirect row indices; if NULL, sequential from row_start. */
+__device__ static void comp_kv_mma_scores_16x8_impl(
         const uint8_t *comp_kv,
         uint32_t row_start,
+        const uint32_t *row_indices,
         uint32_t n_rows,
         const float *q_heads[8],
         float scores_out[16]) {
@@ -2603,30 +2606,20 @@ __device__ static void comp_kv_mma_scores_16x8(
     const uint32_t gid = lane >> 2u;
     if (n_rows > 16u) n_rows = 16u;
 
-    /* Empirically verified layout on Blackwell (sm_120):
-     *   A: row = gid (0..7), a0/a2 = top half, a1/a3 = bottom half
-     *      K-columns packed as consecutive bytes, order doesn't matter
-     *      as long as B uses the SAME packing order
-     *   B: column (head) = gid, K packed same as A
-     *   D: d0=D[gid][tid*2], d1=D[gid][tid*2+1],
-     *      d2=D[gid+8][tid*2], d3=D[gid+8][tid*2+1]
-     *
-     * Packing strategy: each thread loads 4 consecutive K-values per register.
-     * Thread's A registers hold data for rows gid (top) and gid+8 (bottom).
-     * Thread's B registers hold Q data for heads gid (column). */
-
     float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
 
     /* Precompute row pointers for this thread's 2 rows */
     const uint8_t *nope_top = NULL, *nope_bot = NULL;
     const float *scale_top = NULL, *scale_bot = NULL;
     if (gid < n_rows) {
-        const uint8_t *rb = comp_kv + (uint64_t)(row_start + gid) * DS4_FP8_ROW_STRIDE;
+        uint32_t r = row_indices ? row_indices[gid] : (row_start + gid);
+        const uint8_t *rb = comp_kv + (uint64_t)r * DS4_FP8_ROW_STRIDE;
         nope_top = rb + DS4_FP8_NOPE_OFF;
         scale_top = (const float *)(rb + DS4_FP8_SCALES_OFF);
     }
     if (gid + 8u < n_rows) {
-        const uint8_t *rb = comp_kv + (uint64_t)(row_start + gid + 8u) * DS4_FP8_ROW_STRIDE;
+        uint32_t r = row_indices ? row_indices[gid + 8u] : (row_start + gid + 8u);
+        const uint8_t *rb = comp_kv + (uint64_t)r * DS4_FP8_ROW_STRIDE;
         nope_bot = rb + DS4_FP8_NOPE_OFF;
         scale_bot = (const float *)(rb + DS4_FP8_SCALES_OFF);
     }
@@ -2698,8 +2691,9 @@ __device__ static void comp_kv_mma_scores_16x8(
         for (int rh = 0; rh < 2; rh++) {
             uint32_t r = gid + rh * 8u;
             if (r >= n_rows) continue;
+            uint32_t ri = row_indices ? row_indices[r] : (row_start + r);
             const __half *rope = (const __half *)(
-                comp_kv + (uint64_t)(row_start + r) * DS4_FP8_ROW_STRIDE + DS4_FP8_ROPE_OFF);
+                comp_kv + (uint64_t)ri * DS4_FP8_ROW_STRIDE + DS4_FP8_ROPE_OFF);
             float rdot0 = 0.0f, rdot1 = 0.0f;
             #pragma unroll
             for (uint32_t d = 0; d < DS4_FP8_N_ROPE; d++) {
@@ -2724,6 +2718,20 @@ __device__ static void comp_kv_mma_scores_16x8(
         scores_out[(gid + 8u) * 8u + tid * 2u] = d2;
         scores_out[(gid + 8u) * 8u + tid * 2u + 1u] = d3;
     }
+}
+
+/* Sequential rows (for decode: comp rows 0..n-1) */
+__device__ static void comp_kv_mma_scores_16x8(
+        const uint8_t *comp_kv, uint32_t row_start, uint32_t n_rows,
+        const float *q_heads[8], float scores_out[16]) {
+    comp_kv_mma_scores_16x8_impl(comp_kv, row_start, NULL, n_rows, q_heads, scores_out);
+}
+
+/* Indirect rows (for indexed attention: comp_rows[] from topk) */
+__device__ static void comp_kv_mma_scores_16x8_indexed(
+        const uint8_t *comp_kv, const uint32_t *row_indices, uint32_t n_rows,
+        const float *q_heads[8], float scores_out[16]) {
+    comp_kv_mma_scores_16x8_impl(comp_kv, 0, row_indices, n_rows, q_heads, scores_out);
 }
 #endif /* __CUDA_ARCH__ >= 1200 */
 
@@ -4152,13 +4160,211 @@ __global__ static void attention_decode_mma_online_kernel(
         out4[lane] = o0; out4[lane + 32u] = o1; out4[lane + 64u] = o2; out4[lane + 96u] = o3;
     }
 }
-#else /* __CUDA_ARCH__ < 1200: stub kernel that does nothing (never called at runtime) */
+
+/* MMA-accelerated INDEXED attention (the hottest kernel at 16K+).
+ * Same two-phase design as decode MMA, but uses topk indices for comp rows. */
+__global__ static void attention_indexed_mma_online_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_kv,
+        const uint8_t *comp_kv,
+        const int32_t *topk,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t top_k,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    uint32_t t = blockIdx.x;
+    uint32_t head_group = blockIdx.y;
+    if (t >= n_tokens || head_dim != 512u) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t head = head_group * 8u + warp;
+    const bool valid_head = head < n_head;
+
+    __shared__ uint32_t raw_rows[256];
+    __shared__ uint32_t comp_rows[512];
+    __shared__ uint32_t raw_count_s;
+    __shared__ uint32_t comp_count_s;
+    __shared__ float4 kv_shared[4 * 128];
+    __shared__ float mma_scores[16 * 8];
+
+    uint32_t qpos = pos0 + t;
+    uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+    uint32_t visible_comp = n_comp;
+    if (ratio != 0u) {
+        visible_comp = (qpos + 1u) / ratio;
+        if (visible_comp > n_comp) visible_comp = n_comp;
+    }
+
+    if (threadIdx.x == 0) {
+        uint32_t rc = 0, rfi = 0;
+        if (n_raw != 0u) {
+            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+            if (qpos >= first_raw_pos) {
+                uint32_t lo = first_raw_pos;
+                if (window != 0u && qpos + 1u > window) {
+                    const uint32_t wlo = qpos + 1u - window;
+                    if (wlo > lo) lo = wlo;
+                }
+                const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                if (hi >= lo) { rfi = lo - first_raw_pos; rc = hi - lo + 1u; if (rc > 256u) rc = 256u; }
+            }
+        }
+        raw_count_s = rc;
+        uint32_t cc = 0;
+        for (uint32_t i = 0; i < top_k && cc < 512u; i++) {
+            int32_t c = topk[(uint64_t)t * top_k + i];
+            if (c >= 0 && (uint32_t)c < visible_comp) comp_rows[cc++] = (uint32_t)c;
+        }
+        comp_count_s = cc;
+    }
+    __syncthreads();
+    const uint32_t raw_count = raw_count_s;
+    const uint32_t comp_count = comp_count_s;
+    uint32_t raw_first = 0;
+    if (raw_count > 0u && n_raw > 0u) {
+        uint32_t lo = first_raw_pos;
+        if (window != 0u && qpos + 1u > window) {
+            const uint32_t wlo = qpos + 1u - window;
+            if (wlo > lo) lo = wlo;
+        }
+        raw_first = lo - first_raw_pos;
+    }
+    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x)
+        raw_rows[r] = (raw_start + raw_first + r) % raw_cap;
+    __syncthreads();
+
+    const float attn_scale = rsqrtf((float)head_dim);
+    const float4 *q4 = valid_head
+        ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim) : NULL;
+    float4 q0 = {}, q1 = {}, q2 = {}, q3 = {};
+    if (valid_head) {
+        q0 = q4[lane]; q1 = q4[lane + 32u]; q2 = q4[lane + 64u]; q3 = q4[lane + 96u];
+    }
+
+    float max_s = -INFINITY;
+    float sum_s = 0.0f;
+    float4 o0 = {}, o1 = {}, o2 = {}, o3 = {};
+
+    /* Phase A: Raw KV rows via shared memory */
+    for (uint32_t row0 = 0; row0 < raw_count; row0 += 4u) {
+        const uint32_t nr = raw_count - row0 < 4u ? raw_count - row0 : 4u;
+        for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
+            const float4 *src = (const float4 *)(raw_kv + (uint64_t)raw_rows[row0 + (off >> 7u)] * head_dim);
+            kv_shared[off] = src[off & 127u];
+        }
+        __syncthreads();
+        if (valid_head) {
+            for (uint32_t rr = 0; rr < nr; rr++) {
+                const float4 *kv4 = kv_shared + rr * 128u;
+                float4 k0 = kv4[lane]; float4 k1 = kv4[lane + 32u];
+                float4 k2 = kv4[lane + 64u]; float4 k3 = kv4[lane + 96u];
+                float score = (dot4_f32(q0, k0) + dot4_f32(q1, k1) +
+                               dot4_f32(q2, k2) + dot4_f32(q3, k3));
+                score = warp_sum_f32(score) * attn_scale;
+                score = __shfl_sync(0xffffffffu, score, 0);
+                const float new_m = fmaxf(max_s, score);
+                const float os = expf(max_s - new_m), rs = expf(score - new_m);
+                sum_s = sum_s * os + rs;
+                o0.x=o0.x*os+k0.x*rs; o0.y=o0.y*os+k0.y*rs; o0.z=o0.z*os+k0.z*rs; o0.w=o0.w*os+k0.w*rs;
+                o1.x=o1.x*os+k1.x*rs; o1.y=o1.y*os+k1.y*rs; o1.z=o1.z*os+k1.z*rs; o1.w=o1.w*os+k1.w*rs;
+                o2.x=o2.x*os+k2.x*rs; o2.y=o2.y*os+k2.y*rs; o2.z=o2.z*os+k2.z*rs; o2.w=o2.w*os+k2.w*rs;
+                o3.x=o3.x*os+k3.x*rs; o3.y=o3.y*os+k3.y*rs; o3.z=o3.z*os+k3.z*rs; o3.w=o3.w*os+k3.w*rs;
+                max_s = new_m;
+            }
+        }
+        __syncthreads();
+    }
+
+    /* Phase B: Comp KV rows via MMA scores + direct L1 output accum */
+    for (uint32_t ci0 = 0; ci0 < comp_count; ci0 += 16u) {
+        const uint32_t nc = comp_count - ci0 < 16u ? comp_count - ci0 : 16u;
+
+        {
+            const float *q_base = q + (uint64_t)t * n_head * head_dim;
+            const float *q_arr[8];
+            for (int h = 0; h < 8; h++)
+                q_arr[h] = q_base + (uint64_t)(head_group * 8u + h) * head_dim;
+            comp_kv_mma_scores_16x8_indexed(comp_kv, comp_rows + ci0, nc, q_arr, mma_scores);
+        }
+        __syncthreads();
+
+        if (valid_head) {
+            const uint32_t local_head = head - head_group * 8u;
+            for (uint32_t ci = 0; ci < nc; ci++) {
+                float score = mma_scores[ci * 8u + local_head] * attn_scale;
+                const float new_m = fmaxf(max_s, score);
+                const float os = expf(max_s - new_m), rs = expf(score - new_m);
+                sum_s = sum_s * os + rs;
+
+                const uint8_t *rb = comp_kv + (uint64_t)comp_rows[ci0 + ci] * DS4_FP8_ROW_STRIDE;
+                const float *sc = (const float *)(rb + DS4_FP8_SCALES_OFF);
+                const uint8_t *nope = rb + DS4_FP8_NOPE_OFF;
+                const __half *rope = (const __half *)(rb + DS4_FP8_ROPE_OFF);
+
+                uint32_t d = lane;
+                float4 k0 = {}, k1 = {}, k2 = {}, k3 = {};
+                float *kf = (float *)&k0;
+                for (uint32_t i = 0; i < 4; i++, d += 32u) kf[i] = e4m3_hw_to_float(nope[d]) * sc[d >> 6u];
+                kf = (float *)&k1;
+                for (uint32_t i = 0; i < 4; i++, d += 32u)
+                    kf[i] = (d < DS4_FP8_N_NOPE) ? e4m3_hw_to_float(nope[d]) * sc[d >> 6u]
+                                                  : __half2float(rope[d - DS4_FP8_N_NOPE]);
+                kf = (float *)&k2;
+                for (uint32_t i = 0; i < 4; i++, d += 32u)
+                    kf[i] = (d < DS4_FP8_N_NOPE) ? e4m3_hw_to_float(nope[d]) * sc[d >> 6u]
+                            : (d < head_dim) ? __half2float(rope[d - DS4_FP8_N_NOPE]) : 0.0f;
+                kf = (float *)&k3;
+                for (uint32_t i = 0; i < 4; i++, d += 32u)
+                    kf[i] = (d < DS4_FP8_N_NOPE) ? e4m3_hw_to_float(nope[d]) * sc[d >> 6u]
+                            : (d < head_dim) ? __half2float(rope[d - DS4_FP8_N_NOPE]) : 0.0f;
+
+                o0.x=o0.x*os+k0.x*rs; o0.y=o0.y*os+k0.y*rs; o0.z=o0.z*os+k0.z*rs; o0.w=o0.w*os+k0.w*rs;
+                o1.x=o1.x*os+k1.x*rs; o1.y=o1.y*os+k1.y*rs; o1.z=o1.z*os+k1.z*rs; o1.w=o1.w*os+k1.w*rs;
+                o2.x=o2.x*os+k2.x*rs; o2.y=o2.y*os+k2.y*rs; o2.z=o2.z*os+k2.z*rs; o2.w=o2.w*os+k2.w*rs;
+                o3.x=o3.x*os+k3.x*rs; o3.y=o3.y*os+k3.y*rs; o3.z=o3.z*os+k3.z*rs; o3.w=o3.w*os+k3.w*rs;
+                max_s = new_m;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid_head) {
+        const float sink = sinks[head];
+        const float new_m = fmaxf(max_s, sink);
+        const float os = expf(max_s - new_m);
+        sum_s = sum_s * os + expf(sink - new_m);
+        const float inv = 1.0f / sum_s;
+        o0.x *= os * inv; o0.y *= os * inv; o0.z *= os * inv; o0.w *= os * inv;
+        o1.x *= os * inv; o1.y *= os * inv; o1.z *= os * inv; o1.w *= os * inv;
+        o2.x *= os * inv; o2.y *= os * inv; o2.z *= os * inv; o2.w *= os * inv;
+        o3.x *= os * inv; o3.y *= os * inv; o3.z *= os * inv; o3.w *= os * inv;
+        float4 *out4 = (float4 *)(heads + (uint64_t)head * head_dim);
+        out4[lane] = o0; out4[lane + 32u] = o1; out4[lane + 64u] = o2; out4[lane + 96u] = o3;
+    }
+}
+#else /* __CUDA_ARCH__ < 1200: stub kernels */
 __global__ static void attention_decode_mma_online_kernel(
         float *heads, const float *sinks, const float *q,
         const float *raw_kv, const uint8_t *comp_kv,
         uint32_t n_tokens, uint32_t pos0, uint32_t n_raw,
         uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp,
         uint32_t window, uint32_t ratio, uint32_t n_head, uint32_t head_dim) {}
+__global__ static void attention_indexed_mma_online_kernel(
+        float *heads, const float *sinks, const float *q,
+        const float *raw_kv, const uint8_t *comp_kv, const int32_t *topk,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_raw,
+        uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp,
+        uint32_t top_k, uint32_t window, uint32_t ratio,
+        uint32_t n_head, uint32_t head_dim) {}
 #endif /* __CUDA_ARCH__ >= 1200 */
 
 __global__ static void attention_decode_mixed_heads8_online_kernel(
@@ -7056,6 +7262,16 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
+#if DS4_CUDA_MMA_DECODE
+            if (g_cuda_sm_version >= 120 && getenv("DS4_CUDA_NO_MMA") == NULL) {
+                attention_indexed_mma_online_kernel<<<grid, 256>>>((float *)heads->ptr,
+                    sinks, (const float *)q->ptr, (const float *)raw_kv->ptr,
+                    (const uint8_t *)comp_kv->ptr, (const int32_t *)topk->ptr,
+                    n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
+                    top_k, window, ratio, n_head, head_dim);
+                return cuda_ok(cudaGetLastError(), "attention indexed MMA online launch");
+            }
+#endif
             attention_indexed_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                         sinks,
                                                                         (const float *)q->ptr,

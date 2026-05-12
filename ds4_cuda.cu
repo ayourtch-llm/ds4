@@ -2546,6 +2546,145 @@ __device__ __forceinline__ static float comp_kv_dot_strided(
     return dot;
 }
 
+/* ---- Tensor Core MMA helpers for FP8 attention decode ----
+ *
+ * Blackwell mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32
+ * computes D[16×8] = A[16×32] × B[32×8] + C[16×8]  (all e4m3, accum f32)
+ *
+ * For attention QK: A = KV rows (16 rows × 32 dims), B = Q (32 dims × 8 heads)
+ * Iterate K in 32-dim chunks: 512/32 = 16 iterations
+ * Iterate M in 16-row batches: N_comp/16 batches
+ * N = 8 heads per head_group (fixed)
+ *
+ * Register layout per thread (lane 0..31) for m16n8k32 e4m3:
+ *   A: 4 × uint32 → each holds 4 bytes → 16 bytes/thread → 16×32 matrix
+ *   B: 2 × uint32 → each holds 4 bytes →  8 bytes/thread → 32×8 matrix
+ *   D: 4 × float  → 16 bytes/thread → 16×8 matrix
+ */
+
+/* Pack 4 gathered bytes into a uint32 for MMA register. */
+__device__ __forceinline__ static uint32_t pack4(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3) {
+    return (uint32_t)b0 | ((uint32_t)b1 << 8) | ((uint32_t)b2 << 16) | ((uint32_t)b3 << 24);
+}
+
+/* MMA-based FP8 attention score computation: 16 KV rows × 8 heads.
+ *
+ * Uses mma.sync.aligned.kind::f8f6f4.m16n8k32 to compute
+ * scores[16][8] = KV[16×K] × Q[K×8] where KV is e4m3 nope data.
+ * Scales are applied post-MMA per block. Rope is accumulated separately.
+ *
+ * Block layout: 256 threads = 8 warps. Each warp computes one 16×8 tile.
+ * In the attention heads8 kernel, each warp owns 1 head, but MMA gives
+ * us 8 output columns. For MQA (shared KV), we process 8 heads per warp.
+ *
+ * Parameters:
+ *   comp_kv:    packed FP8 KV cache
+ *   row_start:  first compressed KV row index
+ *   n_rows:     number of rows (clamped to 16)
+ *   q_heads:    Q vectors for 8 heads, float [8][512]
+ *   head_dim:   must be 512
+ *   scores_out: output [16][8] scores (only [n_rows][8] valid)
+ */
+__device__ static void comp_kv_mma_scores_16x8(
+        const uint8_t *comp_kv,
+        uint32_t row_start,
+        uint32_t n_rows,
+        const float *q_heads[8],
+        float scores_out[16]) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t tid = lane & 3u;
+    const uint32_t gid = lane >> 2u;
+    if (n_rows > 16u) n_rows = 16u;
+
+    /* ---- Pack B matrix: Q[32×8] for one K-chunk ----
+     * B layout: b0 holds bytes for heads 0..3, b1 for heads 4..7
+     * Each register: 4 bytes at K-positions gid, gid+8, gid+16, gid+24
+     * at head-column tid (b0) or tid+4 (b1). */
+
+    /* We'll iterate over K-chunks of 32 within the 448 nope dims.
+     * For each chunk, pack Q and KV into registers and call MMA.
+     * Accumulate the f32 results across chunks. */
+
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+
+    for (uint32_t kchunk = 0; kchunk < 14u; kchunk++) {
+        const uint32_t kbase = kchunk * 32u;
+
+        /* Pack B (Q) registers for this K-chunk.
+         * b0 byte layout: Q[head=tid, k=kbase+gid], Q[head=tid, k=kbase+gid+8],
+         *                  Q[head=tid, k=kbase+gid+16], Q[head=tid, k=kbase+gid+24]
+         * b1: same but head=tid+4 */
+        uint32_t b0, b1;
+        {
+            const float *qh0 = q_heads[tid];
+            const float *qh1 = q_heads[tid + 4u];
+            b0 = pack4(
+                (uint8_t)__nv_cvt_float_to_fp8(qh0[kbase + gid],      __NV_SATFINITE, __NV_E4M3),
+                (uint8_t)__nv_cvt_float_to_fp8(qh0[kbase + gid + 8u], __NV_SATFINITE, __NV_E4M3),
+                (uint8_t)__nv_cvt_float_to_fp8(qh0[kbase + gid + 16u],__NV_SATFINITE, __NV_E4M3),
+                (uint8_t)__nv_cvt_float_to_fp8(qh0[kbase + gid + 24u],__NV_SATFINITE, __NV_E4M3));
+            b1 = pack4(
+                (uint8_t)__nv_cvt_float_to_fp8(qh1[kbase + gid],      __NV_SATFINITE, __NV_E4M3),
+                (uint8_t)__nv_cvt_float_to_fp8(qh1[kbase + gid + 8u], __NV_SATFINITE, __NV_E4M3),
+                (uint8_t)__nv_cvt_float_to_fp8(qh1[kbase + gid + 16u],__NV_SATFINITE, __NV_E4M3),
+                (uint8_t)__nv_cvt_float_to_fp8(qh1[kbase + gid + 24u],__NV_SATFINITE, __NV_E4M3));
+        }
+
+        /* Pack A (KV) registers for this K-chunk.
+         * a0: A[row=2*tid, k=kbase+gid], A[row=2*tid, k=kbase+gid+16],
+         *     A[row=2*tid+1, k=kbase+gid], A[row=2*tid+1, k=kbase+gid+16]
+         * a1: same but k offsets +8, +24
+         * a2, a3: same but rows +8, +9 */
+        uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        #pragma unroll
+        for (int half = 0; half < 2; half++) {
+            uint32_t r0 = 2u * tid + half * 8u;
+            uint32_t r1 = r0 + 1u;
+            const uint8_t *nope0 = (r0 < n_rows)
+                ? comp_kv + (uint64_t)(row_start + r0) * DS4_FP8_ROW_STRIDE + DS4_FP8_NOPE_OFF
+                : NULL;
+            const uint8_t *nope1 = (r1 < n_rows)
+                ? comp_kv + (uint64_t)(row_start + r1) * DS4_FP8_ROW_STRIDE + DS4_FP8_NOPE_OFF
+                : NULL;
+            uint8_t v0_g  = nope0 ? nope0[kbase + gid]       : 0u;
+            uint8_t v0_g16= nope0 ? nope0[kbase + gid + 16u] : 0u;
+            uint8_t v0_g8 = nope0 ? nope0[kbase + gid + 8u]  : 0u;
+            uint8_t v0_g24= nope0 ? nope0[kbase + gid + 24u] : 0u;
+            uint8_t v1_g  = nope1 ? nope1[kbase + gid]       : 0u;
+            uint8_t v1_g16= nope1 ? nope1[kbase + gid + 16u] : 0u;
+            uint8_t v1_g8 = nope1 ? nope1[kbase + gid + 8u]  : 0u;
+            uint8_t v1_g24= nope1 ? nope1[kbase + gid + 24u] : 0u;
+            if (half == 0) {
+                a0 = pack4(v0_g, v0_g16, v1_g, v1_g16);
+                a1 = pack4(v0_g8, v0_g24, v1_g8, v1_g24);
+            } else {
+                a2 = pack4(v0_g, v0_g16, v1_g, v1_g16);
+                a3 = pack4(v0_g8, v0_g24, v1_g8, v1_g24);
+            }
+        }
+
+        /* MMA: D[16×8] += A[16×32] × B[32×8] */
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+            "{%0, %1, %2, %3}, "
+            "{%4, %5, %6, %7}, "
+            "{%8, %9}, "
+            "{%10, %11, %12, %13};"
+            : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+              "r"(b0), "r"(b1),
+              "f"(d0), "f"(d1), "f"(d2), "f"(d3));
+    }
+
+    /* d0..d3 now hold unscaled nope dot products for 16 rows × 8 heads.
+     * d0 = scores[gid, tid*2], d1 = scores[gid, tid*2+1]
+     * d2 = scores[gid+8, tid*2], d3 = scores[gid+8, tid*2+1]
+     *
+     * TODO: apply per-block scales and add rope contribution.
+     * For now, store raw MMA output for validation. */
+    (void)scores_out;
+}
+
 __global__ static void f32_to_fp8_pack_kernel(uint8_t *out, const float *in, uint32_t n_rows,
                                                uint32_t head_dim, uint32_t n_rot) {
     uint32_t row = blockIdx.x;

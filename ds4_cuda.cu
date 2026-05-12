@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <mma.h>
 #include <cublas_v2.h>
 
@@ -2389,13 +2390,9 @@ enum {
     DS4_FP8_ROW_STRIDE = 640u
 };
 
-__device__ __forceinline__ static float e4m3_byte_to_float(uint8_t v) {
-    uint32_t sign = ((uint32_t)(v & 0x80u)) << 24;
-    uint32_t exp4 = ((uint32_t)v >> 3) & 0xfu;
-    uint32_t man = (uint32_t)v & 0x7u;
-    if (exp4 == 0 && man == 0) return __uint_as_float(sign);
-    if (exp4 == 0) return __uint_as_float(sign | __float_as_uint(ldexpf((float)man, -9)));
-    return __uint_as_float(sign | ((exp4 + 120u) << 23) | (man << 20));
+__device__ __forceinline__ static float e4m3_to_float(uint8_t v) {
+    __half_raw hr = __nv_cvt_fp8_to_halfraw(v, __NV_E4M3);
+    return __half2float(*reinterpret_cast<const __half *>(&hr));
 }
 
 __device__ __forceinline__ static uint8_t float_to_e4m3_byte(float v) {
@@ -2419,7 +2416,7 @@ __device__ __forceinline__ static float comp_kv_load(const uint8_t *p, uint64_t 
     const uint8_t *rb = p + (uint64_t)row * DS4_FP8_ROW_STRIDE;
     if (d < DS4_FP8_N_NOPE) {
         float scale = ((const float *)(rb + DS4_FP8_SCALES_OFF))[d >> 6];
-        return e4m3_byte_to_float(rb[DS4_FP8_NOPE_OFF + d]) * scale;
+        return e4m3_to_float(rb[DS4_FP8_NOPE_OFF + d]) * scale;
     }
     return __half2float(((const __half *)(rb + DS4_FP8_ROPE_OFF))[d - DS4_FP8_N_NOPE]);
 }
@@ -2429,6 +2426,26 @@ __device__ __forceinline__ static float4 comp_kv_load4(const uint8_t *p, uint64_
                        comp_kv_load(p, base + 1),
                        comp_kv_load(p, base + 2),
                        comp_kv_load(p, base + 3));
+}
+
+__device__ __forceinline__ static float comp_kv_dot_row(
+        const float *q, const uint8_t *comp_kv, uint32_t row, uint32_t head_dim) {
+    const uint8_t *rb = comp_kv + (uint64_t)row * DS4_FP8_ROW_STRIDE;
+    const float *scales = (const float *)(rb + DS4_FP8_SCALES_OFF);
+    const uint8_t *nope = rb + DS4_FP8_NOPE_OFF;
+    const __half *rope = (const __half *)(rb + DS4_FP8_ROPE_OFF);
+    const uint32_t n_nope = head_dim - DS4_FP8_N_ROPE;
+    float dot = 0.0f;
+    for (uint32_t blk = 0; blk < DS4_FP8_N_BLOCKS; blk++) {
+        float block_dot = 0.0f;
+        const uint32_t base = blk * DS4_FP8_BLOCK_SIZE;
+        for (uint32_t i = 0; i < DS4_FP8_BLOCK_SIZE; i++)
+            block_dot += q[base + i] * e4m3_to_float(nope[base + i]);
+        dot += block_dot * scales[blk];
+    }
+    for (uint32_t i = 0; i < DS4_FP8_N_ROPE; i++)
+        dot += q[n_nope + i] * __half2float(rope[i]);
+    return dot;
 }
 
 __global__ static void f32_to_fp8_pack_kernel(uint8_t *out, const float *in, uint32_t n_rows,
@@ -2595,9 +2612,7 @@ __global__ static void attention_prefill_mixed_kernel(
         float add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
         float s = -INFINITY;
         if (add > -1.0e20f) {
-            float dot = 0.0f;
-            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * comp_kv_load(comp_kv, (uint64_t)c * head_dim + d);
-            s = dot * scale + add;
+            s = comp_kv_dot_row(qh, comp_kv, c, head_dim) * scale + add;
         }
         scores[raw_count + c] = s;
         local_max = fmaxf(local_max, s);
@@ -2876,9 +2891,7 @@ __global__ static void attention_decode_mixed_kernel(
             float add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
             float s = -INFINITY;
             if (add > -1.0e20f) {
-                    float dot = 0.0f;
-                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * comp_kv_load(comp_kv, (uint64_t)c * head_dim + d);
-                s = dot * scale + add;
+                s = comp_kv_dot_row(qh, comp_kv, c, head_dim) * scale + add;
             }
             scores[raw_count + c] = s;
             local_max = fmaxf(local_max, s);

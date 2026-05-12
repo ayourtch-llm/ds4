@@ -2546,6 +2546,7 @@ __device__ __forceinline__ static float comp_kv_dot_strided(
     return dot;
 }
 
+#if __CUDA_ARCH__ >= 1200
 /* ---- Tensor Core MMA helpers for FP8 attention decode ----
  *
  * Blackwell mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32
@@ -2739,6 +2740,7 @@ __device__ static void comp_kv_mma_scores_16x8(
         scores_out[(gid + 8u) * 8u + tid * 2u + 1u] = d3;
     }
 }
+#endif /* __CUDA_ARCH__ >= 1200 */
 
 __global__ static void f32_to_fp8_pack_kernel(uint8_t *out, const float *in, uint32_t n_rows,
                                                uint32_t head_dim, uint32_t n_rot) {

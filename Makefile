@@ -115,5 +115,11 @@ endif
 test: ds4_test
 	./ds4_test
 
+tests/test_mma_fp8: tests/test_mma_fp8.cu
+	$(NVCC) -O3 --use_fast_math -arch=sm_120 -Xcompiler $(NATIVE_CPU_FLAG) -o $@ $< -lcudart
+
+test-mma: tests/test_mma_fp8
+	./tests/test_mma_fp8
+
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4_cpu ds4_native ds4_server_test ds4_test *.o
+	rm -f ds4 ds4-server ds4-bench ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/test_mma_fp8

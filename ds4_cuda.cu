@@ -86,6 +86,7 @@ static cudaStream_t g_model_upload_stream;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 static int g_quality_mode;
+static __half *g_attn_heads_f16_ptr;
 static cudaStream_t g_async_stream;
 static cublasHandle_t g_async_cublas;
 static int g_async_ready;
@@ -1464,6 +1465,10 @@ extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
+
+extern "C" void ds4_gpu_set_attn_heads_f16(ds4_gpu_tensor *t) {
+    g_attn_heads_f16_ptr = t ? (__half *)t->ptr : NULL;
+}
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
@@ -3704,6 +3709,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
 
 __global__ static void attention_static_mixed_heads8_online_kernel(
         float *heads,
+        __half *heads_f16,
         const float *sinks,
         const float *q,
         const float *raw_kv,
@@ -3847,11 +3853,20 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         o1.x *= inv_s; o1.y *= inv_s; o1.z *= inv_s; o1.w *= inv_s;
         o2.x *= inv_s; o2.y *= inv_s; o2.z *= inv_s; o2.w *= inv_s;
         o3.x *= inv_s; o3.y *= inv_s; o3.z *= inv_s; o3.w *= inv_s;
-        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head + head) * head_dim);
+        const uint64_t hoff = ((uint64_t)t * n_head + head) * head_dim;
+        float4 *out4 = (float4 *)(heads + hoff);
         out4[lane +  0u] = o0;
         out4[lane + 32u] = o1;
         out4[lane + 64u] = o2;
         out4[lane + 96u] = o3;
+        if (heads_f16) {
+            __half2 *oh = (__half2 *)(heads_f16 + hoff);
+            uint32_t b = lane * 2u;
+            oh[b+0u] = __floats2half2_rn(o0.x, o0.y); oh[b+1u] = __floats2half2_rn(o0.z, o0.w);
+            oh[b+64u] = __floats2half2_rn(o1.x, o1.y); oh[b+65u] = __floats2half2_rn(o1.z, o1.w);
+            oh[b+128u] = __floats2half2_rn(o2.x, o2.y); oh[b+129u] = __floats2half2_rn(o2.z, o2.w);
+            oh[b+192u] = __floats2half2_rn(o3.x, o3.y); oh[b+193u] = __floats2half2_rn(o3.z, o3.w);
+        }
     }
 }
 
@@ -7123,6 +7138,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
+                                                                   g_attn_heads_f16_ptr,
                                                                    sinks,
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
@@ -7492,6 +7508,7 @@ static int attention_prefill_mixed_launch(
         (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
         attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
+                                                                   g_attn_heads_f16_ptr,
                                                                    sinks,
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,

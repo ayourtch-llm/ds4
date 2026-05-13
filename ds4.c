@@ -8188,6 +8188,7 @@ typedef struct {
     ds4_gpu_tensor *batch_indexer_q;
     ds4_gpu_tensor *batch_indexer_weights;
     ds4_gpu_tensor *batch_heads;
+    ds4_gpu_tensor *batch_heads_f16;
     ds4_gpu_tensor *batch_attn_low;
     ds4_gpu_tensor *batch_attn_out;
     ds4_gpu_tensor *batch_group_tmp;
@@ -8242,6 +8243,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_group_tmp);
     ds4_gpu_tensor_free(g->batch_attn_out);
     ds4_gpu_tensor_free(g->batch_attn_low);
+    ds4_gpu_tensor_free(g->batch_heads_f16);
     ds4_gpu_tensor_free(g->batch_heads);
     ds4_gpu_tensor_free(g->batch_indexer_weights);
     ds4_gpu_tensor_free(g->batch_indexer_q);
@@ -8753,6 +8755,7 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_indexer_q = ds4_gpu_tensor_alloc(pc * indexer_q_dim * sizeof(float));
     g->batch_indexer_weights = ds4_gpu_tensor_alloc(pc * DS4_N_INDEXER_HEAD * sizeof(float));
     g->batch_heads = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
+    g->batch_heads_f16 = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(uint16_t));
     g->batch_attn_low = ds4_gpu_tensor_alloc(pc * low_dim * sizeof(float));
     g->batch_attn_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
     g->batch_group_tmp = ds4_gpu_tensor_alloc(pc * group_dim * sizeof(float));
@@ -11325,6 +11328,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     DS4_N_HEAD_DIM) != 0;
     const bool raw_batch_attention = zero_prefix && ratio == 0;
     bool batch_attention_done = false;
+    ds4_gpu_set_attn_heads_f16(g->batch_heads_f16);
 
     if (ok && raw_batch_attention) {
         ok = ds4_gpu_attention_prefill_raw_heads_tensor(g->batch_heads,
@@ -12355,7 +12359,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 DS4_N_EMBD,
                                                                 g->batch_heads,
                                                                 n_tokens,
-                                                                NULL) != 0;
+                                                                g->batch_heads_f16) != 0;
     }
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_back", g->batch_heads,

@@ -2134,6 +2134,52 @@ __global__ static void rms_norm_plain_kernel(float *out, const float *x, uint32_
     }
 }
 
+__global__ static void rms_norm_plain_f16_kernel(__half *out, const float *x, uint32_t n, uint32_t rows, float eps) {
+    uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    __half *orow = out + (uint64_t)row * n;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = xr[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(partial[0] / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        orow[i] = __float2half(xr[i] * scale);
+    }
+}
+
+__global__ static void rms_norm_weight_f16_kernel(__half *out, const float *x, const float *w, uint32_t n, uint32_t rows, float eps) {
+    uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    __half *orow = out + (uint64_t)row * n;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = xr[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(partial[0] / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        orow[i] = __float2half(xr[i] * scale * w[i]);
+    }
+}
+
 __global__ static void rms_norm_weight_kernel(float *out, const float *x, const float *w, uint32_t n, uint32_t rows, float eps) {
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
@@ -6029,6 +6075,66 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
 }
 
+extern "C" int ds4_gpu_rms_norm_matmul_f16_tensor(
+        ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *x,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok,
+        float eps) {
+    if (!out || !x || !model_map || !g_cublas_ready || n_tok <= 1) return 0;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
+    uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
+    if (weight_bytes > model_size - weight_offset) return 0;
+    if (x->bytes < n_tok * in_dim * sizeof(float) ||
+        out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f16");
+    if (!wptr) return 0;
+    const __half *w = (const __half *)wptr;
+    const uint64_t xh_count = n_tok * in_dim;
+    const uint64_t xh_bytes = xh_count * sizeof(__half);
+    if (g_xh_cache_bytes < xh_bytes) {
+        if (g_xh_cache) { (void)cudaFree(g_xh_cache); g_xh_cache = NULL; }
+        void *ptr = NULL;
+        if (cudaMalloc(&ptr, (size_t)xh_bytes) != cudaSuccess) {
+            g_xh_cache_bytes = 0;
+            g_xh_cache_src = NULL;
+            return 0;
+        }
+        g_xh_cache = (__half *)ptr;
+        g_xh_cache_bytes = xh_bytes;
+    }
+    rms_norm_plain_f16_kernel<<<(unsigned)n_tok, 256>>>(g_xh_cache, (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)n_tok, eps);
+    if (!cuda_ok(cudaGetLastError(), "rms_norm_f16 launch")) return 0;
+    g_xh_cache_src = NULL;
+    g_xh_cache_count = 0;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasGemmEx(g_cublas,
+                                     CUBLAS_OP_T,
+                                     CUBLAS_OP_N,
+                                     (int)out_dim,
+                                     (int)n_tok,
+                                     (int)in_dim,
+                                     &alpha,
+                                     w,
+                                     CUDA_R_16F,
+                                     (int)in_dim,
+                                     g_xh_cache,
+                                     CUDA_R_16F,
+                                     (int)in_dim,
+                                     &beta,
+                                     out->ptr,
+                                     CUDA_R_32F,
+                                     (int)out_dim,
+                                     CUDA_R_32F,
+                                     CUBLAS_GEMM_DEFAULT);
+    return cublas_ok(st, "rms_norm_matmul_f16");
+}
+
 extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         ds4_gpu_tensor *out0,
         ds4_gpu_tensor *out1,
@@ -9860,13 +9966,14 @@ static int routed_moe_launch(
             const uint64_t cursors_bytes = 256ull * sizeof(uint32_t);
             const uint64_t sorted_bytes = (uint64_t)pair_count * sizeof(uint32_t);
             tile_capacity = (pair_count + expert_tile_m - 1u) / expert_tile_m + 256u;
-            tile16_capacity = use_down_tile16 ? ((pair_count + 15u) / 16u + 256u) : 0u;
+            const uint32_t need_tile16 = use_down_tile16 || use_tile16_gate;
+            tile16_capacity = need_tile16 ? ((pair_count + 15u) / 16u + 256u) : 0u;
             const uint64_t tile_offsets_bytes = 257ull * sizeof(uint32_t);
             const uint64_t tile_total_bytes = sizeof(uint32_t);
             const uint64_t tile_experts_bytes = (uint64_t)tile_capacity * sizeof(uint32_t);
             const uint64_t tile_starts_bytes = (uint64_t)tile_capacity * sizeof(uint32_t);
-            const uint64_t tile16_offsets_bytes = use_down_tile16 ? 257ull * sizeof(uint32_t) : 0u;
-            const uint64_t tile16_total_bytes = use_down_tile16 ? sizeof(uint32_t) : 0u;
+            const uint64_t tile16_offsets_bytes = need_tile16 ? 257ull * sizeof(uint32_t) : 0u;
+            const uint64_t tile16_total_bytes = need_tile16 ? sizeof(uint32_t) : 0u;
             const uint64_t tile16_experts_bytes = (uint64_t)tile16_capacity * sizeof(uint32_t);
             const uint64_t tile16_starts_bytes = (uint64_t)tile16_capacity * sizeof(uint32_t);
             const uint64_t tile_offsets_off = counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes;
@@ -9925,11 +10032,11 @@ static int routed_moe_launch(
                     moe_build_expert_tiles_kernel<<<1, 256>>>(tile_experts, tile_starts, tile_offsets, counts, expert_tile_m);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tiles launch");
                 }
-                if (ok && use_expert_tiles && use_down_tile16) {
+                if (ok && use_expert_tiles && need_tile16) {
                     moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile16_offsets, tile16_total, counts, 16u);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 offsets launch");
                 }
-                if (ok && use_expert_tiles && use_down_tile16) {
+                if (ok && use_expert_tiles && need_tile16) {
                     moe_build_expert_tiles_kernel<<<1, 256>>>(tile16_experts, tile16_starts, tile16_offsets, counts, 16u);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 launch");
                 }

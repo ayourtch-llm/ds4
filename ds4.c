@@ -9901,19 +9901,31 @@ static bool metal_graph_encode_output_head_batch(
                                    (uint64_t)n_tokens * vocab_dim * sizeof(float));
     ok = output_pre && output_weights && output_embd && output_norm && logits;
 
-    if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
-                                                      g->batch_cur_hc,
-                                                      (uint32_t)hc_dim,
-                                                      n_tokens,
-                                                      DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_f16_tensor(output_pre,
-                                             model->map,
-                                             model->size,
-                                             weights->output_hc_fn->abs_offset,
-                                             hc_dim,
-                                             DS4_N_HC,
-                                             g->batch_flat_hc,
-                                             n_tokens) != 0;
+    if (ok && n_tokens > 1) {
+        ok = ds4_gpu_rms_norm_matmul_f16_tensor(output_pre,
+                                                  g->batch_cur_hc,
+                                                  model->map,
+                                                  model->size,
+                                                  weights->output_hc_fn->abs_offset,
+                                                  hc_dim,
+                                                  DS4_N_HC,
+                                                  n_tokens,
+                                                  DS4_RMS_EPS) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
+                                                  g->batch_cur_hc,
+                                                  (uint32_t)hc_dim,
+                                                  n_tokens,
+                                                  DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_matmul_f16_tensor(output_pre,
+                                                 model->map,
+                                                 model->size,
+                                                 weights->output_hc_fn->abs_offset,
+                                                 hc_dim,
+                                                 DS4_N_HC,
+                                                 g->batch_flat_hc,
+                                                 n_tokens) != 0;
+    }
     if (ok) ok = ds4_gpu_output_hc_weights_tensor(output_weights,
                                                     output_pre,
                                                     model->map,
@@ -11024,19 +11036,31 @@ static bool metal_graph_encode_layer_attention_batch(
     ds4_gpu_tensor *after_attn_hc_view = ds4_gpu_tensor_view(
             g->batch_after_attn_hc, 0, (uint64_t)n_tokens * hc_dim * sizeof(float));
     bool ok = hc_mix_view && hc_split_view && attn_cur_view && after_attn_hc_view;
-    if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
-                                                      g->batch_cur_hc,
-                                                      (uint32_t)hc_dim,
-                                                      n_tokens,
-                                                      DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_f16_tensor(hc_mix_view,
-                                             model->map,
-                                             model->size,
-                                             layer->hc_attn_fn->abs_offset,
-                                             hc_dim,
-                                             mix_hc,
-                                             g->batch_flat_hc,
-                                             n_tokens) != 0;
+    if (ok && n_tokens > 1) {
+        ok = ds4_gpu_rms_norm_matmul_f16_tensor(hc_mix_view,
+                                                  g->batch_cur_hc,
+                                                  model->map,
+                                                  model->size,
+                                                  layer->hc_attn_fn->abs_offset,
+                                                  hc_dim,
+                                                  mix_hc,
+                                                  n_tokens,
+                                                  DS4_RMS_EPS) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
+                                                  g->batch_cur_hc,
+                                                  (uint32_t)hc_dim,
+                                                  n_tokens,
+                                                  DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_matmul_f16_tensor(hc_mix_view,
+                                                 model->map,
+                                                 model->size,
+                                                 layer->hc_attn_fn->abs_offset,
+                                                 hc_dim,
+                                                 mix_hc,
+                                                 g->batch_flat_hc,
+                                                 n_tokens) != 0;
+    }
     if (metal_graph_use_reference_hc_decode()) {
         if (ok) ok = ds4_gpu_hc_split_sinkhorn_tensor(hc_split_view,
                                                         hc_mix_view,
@@ -12326,19 +12350,31 @@ static bool metal_graph_encode_layer_ffn_batch(
     ds4_gpu_tensor *next_hc_view = ds4_gpu_tensor_view(
             g->batch_next_hc, 0, (uint64_t)n_tokens * hc_dim * sizeof(float));
     bool ok = hc_mix_view && hc_split_view && ffn_cur_view && next_hc_view;
-    if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
-                                                      g->batch_after_attn_hc,
-                                                      (uint32_t)hc_dim,
-                                                      n_tokens,
-                                                      DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_matmul_f16_tensor(hc_mix_view,
-                                             model->map,
-                                             model->size,
-                                             layer->hc_ffn_fn->abs_offset,
-                                             hc_dim,
-                                             mix_hc,
-                                             g->batch_flat_hc,
-                                             n_tokens) != 0;
+    if (ok && n_tokens > 1) {
+        ok = ds4_gpu_rms_norm_matmul_f16_tensor(hc_mix_view,
+                                                  g->batch_after_attn_hc,
+                                                  model->map,
+                                                  model->size,
+                                                  layer->hc_ffn_fn->abs_offset,
+                                                  hc_dim,
+                                                  mix_hc,
+                                                  n_tokens,
+                                                  DS4_RMS_EPS) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
+                                                  g->batch_after_attn_hc,
+                                                  (uint32_t)hc_dim,
+                                                  n_tokens,
+                                                  DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_matmul_f16_tensor(hc_mix_view,
+                                                 model->map,
+                                                 model->size,
+                                                 layer->hc_ffn_fn->abs_offset,
+                                                 hc_dim,
+                                                 mix_hc,
+                                                 g->batch_flat_hc,
+                                                 n_tokens) != 0;
+    }
     if (metal_graph_use_reference_hc_decode()) {
         if (ok) ok = ds4_gpu_hc_split_sinkhorn_tensor(hc_split_view,
                                                         hc_mix_view,

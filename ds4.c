@@ -11111,6 +11111,28 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("norm");
+    /* Overlap: launch compressor matmuls on async stream while q_path runs on
+     * default stream.  Both only need batch_attn_norm (ready after norm). */
+    bool async_comp_started = false;
+    if (ok && ratio != 0 && layer->attn_compressor_kv && layer->attn_compressor_gate &&
+        getenv("DS4_CUDA_NO_ASYNC_COMP") == NULL) {
+        const uint32_t coff = ratio == 4 ? 2u : 1u;
+        const uint32_t comp_width = coff * DS4_N_HEAD_DIM;
+        if (ds4_gpu_begin_async()) {
+            bool aok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv,
+                                                   model->map, model->size,
+                                                   layer->attn_compressor_kv->abs_offset,
+                                                   DS4_N_EMBD, comp_width,
+                                                   g->batch_attn_norm, n_tokens) != 0;
+            if (aok) aok = ds4_gpu_matmul_f16_tensor(g->batch_comp_sc,
+                                                       model->map, model->size,
+                                                       layer->attn_compressor_gate->abs_offset,
+                                                       DS4_N_EMBD, comp_width,
+                                                       g->batch_attn_norm, n_tokens) != 0;
+            ds4_gpu_end_async();
+            async_comp_started = aok;
+        }
+    }
     DS4_METAL_PROFILE_Q_STAGE("pre_q");
     if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_qr,
                                               model->map,
@@ -11369,27 +11391,31 @@ static bool metal_graph_encode_layer_attention_batch(
             fprintf(stderr, "ds4: Metal layer-major prefill needs attention compressor weights\n");
             ok = false;
         }
-        if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv,
-                                                 model->map,
-                                                 model->size,
-                                                 layer->attn_compressor_kv->abs_offset,
-                                                 DS4_N_EMBD,
-                                                 comp_width,
-                                                 g->batch_attn_norm,
-                                                 n_tokens) != 0;
+        if (async_comp_started) {
+            if (ok) ok = ds4_gpu_sync_async() != 0;
+        } else {
+            if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv,
+                                                     model->map,
+                                                     model->size,
+                                                     layer->attn_compressor_kv->abs_offset,
+                                                     DS4_N_EMBD,
+                                                     comp_width,
+                                                     g->batch_attn_norm,
+                                                     n_tokens) != 0;
+            if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_sc,
+                                                     model->map,
+                                                     model->size,
+                                                     layer->attn_compressor_gate->abs_offset,
+                                                     DS4_N_EMBD,
+                                                     comp_width,
+                                                     g->batch_attn_norm,
+                                                     n_tokens) != 0;
+        }
         if (ok) metal_graph_debug_dump_tensor("attn_comp_kv_raw",
                                               g->batch_comp_kv,
                                               (uint64_t)comp_width * n_tokens,
                                               il,
                                               pos0);
-        if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_sc,
-                                                 model->map,
-                                                 model->size,
-                                                 layer->attn_compressor_gate->abs_offset,
-                                                 DS4_N_EMBD,
-                                                 comp_width,
-                                                 g->batch_attn_norm,
-                                                 n_tokens) != 0;
         if (ok) metal_graph_debug_dump_tensor("attn_comp_score_raw",
                                               g->batch_comp_sc,
                                               (uint64_t)comp_width * n_tokens,

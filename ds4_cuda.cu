@@ -10263,7 +10263,7 @@ static int routed_moe_launch(
             const uint64_t cursors_bytes = 256ull * sizeof(uint32_t);
             const uint64_t sorted_bytes = (uint64_t)pair_count * sizeof(uint32_t);
             tile_capacity = (pair_count + expert_tile_m - 1u) / expert_tile_m + 256u;
-            const uint32_t need_tile16 = use_down_tile16 || use_tile16_gate;
+            const uint32_t need_tile16 = use_down_tile16;
             tile16_capacity = need_tile16 ? ((pair_count + 15u) / 16u + 256u) : 0u;
             const uint64_t tile_offsets_bytes = 257ull * sizeof(uint32_t);
             const uint64_t tile_total_bytes = sizeof(uint32_t);

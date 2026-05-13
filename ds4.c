@@ -9587,7 +9587,7 @@ static bool metal_graph_encode_decode_layer(
                                                         layer->attn_output_b->abs_offset,
                                                         group_dim, rank,
                                                         n_groups, DS4_N_EMBD,
-                                                        g->heads, 1) != 0;
+                                                        g->heads, 1, NULL) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attn_output");
     if (ok) {
@@ -12267,39 +12267,74 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_dump_tensor("kqv_out", g->batch_heads,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_heads,
-                                            n_tokens,
-                                            DS4_N_HEAD,
-                                            DS4_N_HEAD_DIM,
-                                            DS4_N_ROT,
-                                            pos0,
-                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                            true,
-                                            freq_base,
-                                            freq_scale,
-                                            ext_factor,
-                                            attn_factor,
-                                            DS4_ROPE_YARN_BETA_FAST,
-                                            DS4_ROPE_YARN_BETA_SLOW) != 0;
+    if (ok && n_tokens > 1 && g->batch_q_f16 &&
+        getenv("DS4_CUDA_NO_HEADS_F16") == NULL) {
+        ok = ds4_gpu_inv_rope_f16_tensor(g->batch_q_f16,
+                                           g->batch_heads,
+                                           n_tokens,
+                                           DS4_N_HEAD,
+                                           DS4_N_HEAD_DIM,
+                                           DS4_N_ROT,
+                                           pos0,
+                                           compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                           freq_base,
+                                           freq_scale,
+                                           ext_factor,
+                                           attn_factor,
+                                           DS4_ROPE_YARN_BETA_FAST,
+                                           DS4_ROPE_YARN_BETA_SLOW) != 0;
+        DS4_METAL_PROFILE_ATTN_STAGE("inv_rope_f16");
+        if (ok) ok = ds4_gpu_attention_output_q8_batch_tensor(g->batch_attn_out,
+                                                                g->batch_attn_low,
+                                                                g->batch_group_tmp,
+                                                                g->batch_low_tmp,
+                                                                model->map,
+                                                                model->size,
+                                                                layer->attn_output_a->abs_offset,
+                                                                layer->attn_output_b->abs_offset,
+                                                                group_dim,
+                                                                rank,
+                                                                n_groups,
+                                                                DS4_N_EMBD,
+                                                                g->batch_heads,
+                                                                n_tokens,
+                                                                g->batch_q_f16) != 0;
+    } else {
+        if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_heads,
+                                                n_tokens,
+                                                DS4_N_HEAD,
+                                                DS4_N_HEAD_DIM,
+                                                DS4_N_ROT,
+                                                pos0,
+                                                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                true,
+                                                freq_base,
+                                                freq_scale,
+                                                ext_factor,
+                                                attn_factor,
+                                                DS4_ROPE_YARN_BETA_FAST,
+                                                DS4_ROPE_YARN_BETA_SLOW) != 0;
+        DS4_METAL_PROFILE_ATTN_STAGE("inv_rope");
+        if (ok) ok = ds4_gpu_attention_output_q8_batch_tensor(g->batch_attn_out,
+                                                                g->batch_attn_low,
+                                                                g->batch_group_tmp,
+                                                                g->batch_low_tmp,
+                                                                model->map,
+                                                                model->size,
+                                                                layer->attn_output_a->abs_offset,
+                                                                layer->attn_output_b->abs_offset,
+                                                                group_dim,
+                                                                rank,
+                                                                n_groups,
+                                                                DS4_N_EMBD,
+                                                                g->batch_heads,
+                                                                n_tokens,
+                                                                NULL) != 0;
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_back", g->batch_heads,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
-    DS4_METAL_PROFILE_ATTN_STAGE("inv_rope");
-    if (ok) ok = ds4_gpu_attention_output_q8_batch_tensor(g->batch_attn_out,
-                                                            g->batch_attn_low,
-                                                            g->batch_group_tmp,
-                                                            g->batch_low_tmp,
-                                                            model->map,
-                                                            model->size,
-                                                            layer->attn_output_a->abs_offset,
-                                                            layer->attn_output_b->abs_offset,
-                                                            group_dim,
-                                                            rank,
-                                                            n_groups,
-                                                            DS4_N_EMBD,
-                                                            g->batch_heads,
-                                                            n_tokens) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("attn_low", g->batch_attn_low,
                                       (uint64_t)n_tokens * n_groups * rank,

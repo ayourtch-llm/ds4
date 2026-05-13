@@ -581,7 +581,24 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         uint32_t                n_groups,
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
-        uint32_t                n_tokens);
+        uint32_t                n_tokens,
+        const ds4_gpu_tensor *heads_f16);
+
+int ds4_gpu_inv_rope_f16_tensor(
+        ds4_gpu_tensor       *out_f16,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tok,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                pos0,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow);
 
 int ds4_gpu_attention_output_low_q8_tensor(
         ds4_gpu_tensor       *low,

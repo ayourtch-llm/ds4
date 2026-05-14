@@ -86,6 +86,11 @@ static cudaStream_t g_model_upload_stream;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 static int g_quality_mode;
+static cudaStream_t g_async_stream;
+static cublasHandle_t g_async_cublas;
+static int g_async_ready;
+static cudaStream_t g_active_stream;
+static cublasHandle_t g_active_cublas;
 
 struct cuda_model_range {
     const void *host_base;
@@ -210,7 +215,7 @@ static __half *cuda_get_f16_activations(const float *src, uint64_t count) {
         g_xh_cache = (__half *)ptr;
         g_xh_cache_bytes = bytes;
     }
-    f32_to_f16_kernel<<<(count + 255) / 256, 256>>>(g_xh_cache, src, count);
+    f32_to_f16_kernel<<<(count + 255) / 256, 256, 0, g_active_stream>>>(g_xh_cache, src, count);
     if (cudaGetLastError() != cudaSuccess) {
         g_xh_cache_src = NULL;
         return NULL;
@@ -1252,12 +1257,38 @@ extern "C" int ds4_gpu_init(void) {
                 : CUBLAS_TF32_TENSOR_OP_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);
         g_cublas_ready = 1;
+        g_active_cublas = g_cublas;
+        g_active_stream = 0;
+    }
+    if (!g_async_ready && getenv("DS4_CUDA_NO_ASYNC_SHARED_EXPERT") == NULL) {
+        cudaError_t err = cudaStreamCreateWithFlags(&g_async_stream, cudaStreamNonBlocking);
+        if (err == cudaSuccess) {
+            if (cublas_ok(cublasCreate(&g_async_cublas), "create async handle")) {
+                const cublasMath_t math_mode =
+                    (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
+                        ? CUBLAS_DEFAULT_MATH
+                        : CUBLAS_TF32_TENSOR_OP_MATH;
+                (void)cublasSetMathMode(g_async_cublas, math_mode);
+                (void)cublasSetStream(g_async_cublas, g_async_stream);
+                g_async_ready = 1;
+            } else {
+                (void)cudaStreamDestroy(g_async_stream);
+                g_async_stream = 0;
+            }
+        }
     }
     return 1;
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    if (g_async_ready) {
+        (void)cublasDestroy(g_async_cublas);
+        (void)cudaStreamDestroy(g_async_stream);
+        g_async_ready = 0;
+        g_async_cublas = NULL;
+        g_async_stream = 0;
+    }
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
         g_cublas_ready = 0;
@@ -1453,6 +1484,35 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                    "tensor copy");
 }
 
+extern "C" int ds4_gpu_begin_async(void) {
+    if (!g_async_ready) return 0;
+    /* Quality mode falls back to native Q8/f16 kernels that launch on stream 0
+     * rather than g_active_stream, which would race the async stream. Refuse
+     * async here so callers run the work sequentially. */
+    if (g_quality_mode) return 0;
+    cudaEvent_t ev;
+    if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) return 0;
+    if (cudaEventRecord(ev, 0) != cudaSuccess) { (void)cudaEventDestroy(ev); return 0; }
+    if (cudaStreamWaitEvent(g_async_stream, ev, 0) != cudaSuccess) { (void)cudaEventDestroy(ev); return 0; }
+    (void)cudaEventDestroy(ev);
+    g_active_cublas = g_async_cublas;
+    g_active_stream = g_async_stream;
+    return 1;
+}
+extern "C" int ds4_gpu_end_async(void) {
+    g_active_cublas = g_cublas;
+    g_active_stream = 0;
+    return 1;
+}
+extern "C" int ds4_gpu_sync_async(void) {
+    if (!g_async_ready) return 1;
+    cudaEvent_t ev;
+    if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) return 0;
+    if (cudaEventRecord(ev, g_async_stream) != cudaSuccess) { (void)cudaEventDestroy(ev); return 0; }
+    if (cudaStreamWaitEvent(0, ev, 0) != cudaSuccess) { (void)cudaEventDestroy(ev); return 0; }
+    (void)cudaEventDestroy(ev);
+    return 1;
+}
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
@@ -5867,7 +5927,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         if (w_f32) {
             const float alpha = 1.0f;
             const float beta = 0.0f;
-            cublasStatus_t st = cublasSgemm(g_cublas,
+            cublasStatus_t st = cublasSgemm(g_active_cublas,
                                             CUBLAS_OP_T,
                                             CUBLAS_OP_N,
                                             (int)out_dim,
@@ -5890,7 +5950,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             if (!xh) return 0;
             const float alpha = 1.0f;
             const float beta = 0.0f;
-            cublasStatus_t st = cublasGemmEx(g_cublas,
+            cublasStatus_t st = cublasGemmEx(g_active_cublas,
                                              CUBLAS_OP_T,
                                              CUBLAS_OP_N,
                                              (int)out_dim,
@@ -7622,7 +7682,7 @@ extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
         out->bytes < (uint64_t)n * sizeof(float) ||
         gate->bytes < (uint64_t)n * sizeof(float) ||
         up->bytes < (uint64_t)n * sizeof(float)) return 0;
-    swiglu_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight);
+    swiglu_kernel<<<(n + 255) / 256, 256, 0, g_active_stream>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight);
     return cuda_ok(cudaGetLastError(), "swiglu launch");
 }
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(

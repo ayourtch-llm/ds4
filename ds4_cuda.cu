@@ -141,6 +141,10 @@ static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
 static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
+static __half *g_xh_cache;
+static uint64_t g_xh_cache_bytes;
+static const float *g_xh_cache_src;
+static uint64_t g_xh_cache_count;
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -152,6 +156,7 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t offset,
         uint64_t bytes,
         const char *what);
+__global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n);
 __global__ static void dequant_q8_0_to_f16_kernel(
         __half *out,
         const unsigned char *w,
@@ -184,6 +189,35 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     g_cuda_tmp = ptr;
     g_cuda_tmp_bytes = bytes;
     return g_cuda_tmp;
+}
+
+static uint64_t g_xh_cache_hits, g_xh_cache_misses;
+static __half *cuda_get_f16_activations(const float *src, uint64_t count) {
+    if (src == g_xh_cache_src && count == g_xh_cache_count && g_xh_cache) {
+        g_xh_cache_hits++;
+        return g_xh_cache;
+    }
+    g_xh_cache_misses++;
+    const uint64_t bytes = count * sizeof(__half);
+    if (g_xh_cache_bytes < bytes) {
+        if (g_xh_cache) { (void)cudaFree(g_xh_cache); g_xh_cache = NULL; }
+        void *ptr = NULL;
+        if (cudaMalloc(&ptr, (size_t)bytes) != cudaSuccess) {
+            g_xh_cache_bytes = 0;
+            g_xh_cache_src = NULL;
+            return NULL;
+        }
+        g_xh_cache = (__half *)ptr;
+        g_xh_cache_bytes = bytes;
+    }
+    f32_to_f16_kernel<<<(count + 255) / 256, 256>>>(g_xh_cache, src, count);
+    if (cudaGetLastError() != cudaSuccess) {
+        g_xh_cache_src = NULL;
+        return NULL;
+    }
+    g_xh_cache_src = src;
+    g_xh_cache_count = count;
+    return g_xh_cache;
 }
 
 static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
@@ -1243,6 +1277,16 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaFree(g_cuda_tmp);
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
+    }
+    if (g_xh_cache) {
+        if (g_xh_cache_hits + g_xh_cache_misses > 0)
+            fprintf(stderr, "ds4: f16 activation cache: %lu hits, %lu misses\n",
+                    (unsigned long)g_xh_cache_hits, (unsigned long)g_xh_cache_misses);
+        (void)cudaFree(g_xh_cache);
+        g_xh_cache = NULL;
+        g_xh_cache_bytes = 0;
+        g_xh_cache_src = NULL;
+        g_xh_cache_count = 0;
     }
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
@@ -5796,10 +5840,8 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         const __half *w_f16 = cuda_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
         if (w_f16) {
             const uint64_t xh_count = n_tok * in_dim;
-            __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "q8 f16 gemm activations");
+            __half *xh = cuda_get_f16_activations((const float *)x->ptr, xh_count);
             if (!xh) return 0;
-            f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
-            if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
             const float alpha = 1.0f;
             const float beta = 0.0f;
             cublasStatus_t st = cublasGemmEx(g_cublas,
@@ -6038,10 +6080,8 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL;
     if (!serial_f16 && g_cublas_ready && n_tok > 1) {
         const uint64_t xh_count = n_tok * in_dim;
-        __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
+        __half *xh = cuda_get_f16_activations((const float *)x->ptr, xh_count);
         if (!xh) return 0;
-        f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
-        if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublasStatus_t st = cublasGemmEx(g_cublas,

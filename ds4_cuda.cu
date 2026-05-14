@@ -2414,6 +2414,75 @@ __global__ static void head_rms_norm_kernel(float *x, uint32_t n_tok, uint32_t n
 
 __device__ static float rope_yarn_ramp_dev(float low, float high, int i0);
 
+__global__ static void head_rms_norm_rope_tail_f16in_kernel(
+        float *out,
+        const __half *x_f16,
+        uint32_t n_tok,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        uint32_t pos0,
+        uint32_t n_ctx_orig,
+        int inverse,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow,
+        float eps) {
+    uint32_t row = blockIdx.x;
+    if (row >= n_tok * n_head) return;
+    uint32_t t = row / n_head;
+    const __half *xr_h = x_f16 + (uint64_t)row * head_dim;
+    float *orow = out + (uint64_t)row * head_dim;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float v = __half2float(xr_h[i]);
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)head_dim + eps);
+    const uint32_t n_nope = head_dim - n_rot;
+    for (uint32_t i = threadIdx.x; i < n_nope; i += blockDim.x) {
+        orow[i] = __half2float(xr_h[i]) * scale;
+    }
+    float corr0 = 0.0f, corr1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        float denom = 2.0f * logf(freq_base);
+        corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+        corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+        corr0 = fmaxf(0.0f, corr0);
+        corr1 = fminf((float)(n_rot - 1), corr1);
+    }
+    for (uint32_t pair = threadIdx.x; pair < n_rot / 2; pair += blockDim.x) {
+        uint32_t i = pair * 2u;
+        float theta_extrap = (float)(pos0 + t) * powf(freq_base, -((float)i) / (float)n_rot);
+        float theta_interp = freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = attn_factor;
+        if (ext_factor != 0.0f) {
+            float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
+            theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+        float c = cosf(theta) * mscale;
+        float s = sinf(theta) * mscale;
+        if (inverse) s = -s;
+        float x0 = __half2float(xr_h[n_nope + i]) * scale;
+        float x1 = __half2float(xr_h[n_nope + i + 1]) * scale;
+        orow[n_nope + i] = x0 * c - x1 * s;
+        orow[n_nope + i + 1] = x0 * s + x1 * c;
+    }
+}
+
+
 __global__ static void head_rms_norm_rope_tail_kernel(
         float *x,
         uint32_t n_tok,
@@ -6475,6 +6544,39 @@ extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_
         x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
     head_rms_norm_rope_tail_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
     return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
+}
+extern "C" int ds4_gpu_head_rms_norm_rope_tail_f16in_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x_f16, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps) {
+    if (!out || !x_f16 || n_rot > head_dim || (n_rot & 1u) ||
+        out->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float) ||
+        x_f16->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(__half)) return 0;
+    head_rms_norm_rope_tail_f16in_kernel<<<n_tok * n_head, 256>>>((float *)out->ptr, (const __half *)x_f16->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail_f16in launch");
+}
+extern "C" int ds4_gpu_matmul_q8_0_f16out_tensor(ds4_gpu_tensor *out_f16, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    if (!out_f16 || !x || !model_map || !g_cublas_ready || n_tok <= 1) return 0;
+    uint64_t blocks = (in_dim + 31) / 32;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
+    uint64_t weight_bytes = out_dim * blocks * 34;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    if (x->bytes < n_tok * in_dim * sizeof(float) ||
+        out_f16->bytes < n_tok * out_dim * sizeof(__half)) return 0;
+    const __half *w_f16 = cuda_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, "q8_0");
+    if (!w_f16) return 0;
+    const uint64_t xh_count = n_tok * in_dim;
+    __half *xh = cuda_get_f16_activations((const float *)x->ptr, xh_count);
+    if (!xh) return 0;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasGemmEx(g_active_cublas,
+                                     CUBLAS_OP_T, CUBLAS_OP_N,
+                                     (int)out_dim, (int)n_tok, (int)in_dim,
+                                     &alpha,
+                                     w_f16, CUDA_R_16F, (int)in_dim,
+                                     xh, CUDA_R_16F, (int)in_dim,
+                                     &beta,
+                                     out_f16->ptr, CUDA_R_16F, (int)out_dim,
+                                     CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+    return cublas_ok(st, "q8_0_f16out matmul");
 }
 extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
     if (!x || n_rot > head_dim || x->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;

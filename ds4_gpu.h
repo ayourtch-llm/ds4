@@ -144,6 +144,34 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+int ds4_gpu_matmul_q8_0_f16out_tensor(
+        ds4_gpu_tensor       *out_f16,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
+int ds4_gpu_head_rms_norm_rope_tail_f16in_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x_f16,
+        uint32_t                n_tok,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                pos0,
+        uint32_t                n_ctx_orig,
+        bool                    inverse,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow,
+        float                   eps);
+
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,

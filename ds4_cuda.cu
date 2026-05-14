@@ -2977,6 +2977,55 @@ __global__ static void attention_prefill_unpack_heads_kernel(
     heads[gid] = tmp[((uint64_t)h * n_tokens + t) * head_dim + d];
 }
 
+__global__ static void attention_inv_rope_f16_kernel(
+        __half *out_f16,
+        const float *heads,
+        uint32_t n_tok,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        uint32_t pos0,
+        uint32_t n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t total = (uint64_t)n_tok * n_head * head_dim;
+    if (gid >= total) return;
+    uint32_t d = gid % head_dim;
+    uint64_t tmp = gid / head_dim;
+    uint32_t h = tmp % n_head;
+    uint32_t t = tmp / n_head;
+    uint32_t n_nope = head_dim - n_rot;
+    float v = heads[gid];
+    if (d >= n_nope) {
+        uint32_t i = d - n_nope;
+        uint32_t pair = i / 2u;
+        float theta_extrap = (float)(pos0 + t) * powf(freq_base, -((float)(pair * 2)) / (float)n_rot);
+        float theta_interp = freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = attn_factor;
+        if (ext_factor != 0.0f) {
+            float ramp_mix = rope_yarn_ramp_dev(
+                fmaxf(0.0f, floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / (2.0f * logf(freq_base)))),
+                fminf((float)(n_rot - 1), ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / (2.0f * logf(freq_base)))),
+                (int)(pair * 2)) * ext_factor;
+            theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+        float c = cosf(theta) * mscale;
+        float s = -sinf(theta) * mscale;
+        uint64_t partner = (i & 1u) ? gid - 1u : gid + 1u;
+        float vp = heads[partner];
+        if (i & 1u) v = vp * s + v * c;
+        else        v = v * c - vp * s;
+    }
+    out_f16[gid] = __float2half(v);
+}
+
 __global__ static void attention_pack_group_heads_f16_kernel(
         __half *dst,
         const float *heads,
@@ -6589,6 +6638,14 @@ extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint3
     rope_tail_kernel<<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
     return cuda_ok(cudaGetLastError(), "rope_tail launch");
 }
+extern "C" int ds4_gpu_inv_rope_f16_tensor(ds4_gpu_tensor *out_f16, const ds4_gpu_tensor *heads, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+    if (!out_f16 || !heads || n_rot > head_dim || (n_rot & 1) ||
+        heads->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float) ||
+        out_f16->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(__half)) return 0;
+    uint64_t total = (uint64_t)n_tok * n_head * head_dim;
+    attention_inv_rope_f16_kernel<<<(total + 255) / 256, 256>>>((__half *)out_f16->ptr, (const float *)heads->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    return cuda_ok(cudaGetLastError(), "inv_rope_f16 launch");
+}
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
 extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         ds4_gpu_tensor *kv,
@@ -7593,7 +7650,8 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         uint32_t                n_groups,
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        const ds4_gpu_tensor *heads_f16) {
     (void)group_tmp;
     (void)low_tmp;
     if (!out || !low || !heads || !model_map ||
@@ -7633,7 +7691,54 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         getenv("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A") == NULL) {
         out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, "attn_output_a");
     }
-    if (out_a_f16) {
+    if (out_a_f16 && heads_f16 &&
+        heads_f16->bytes >= (uint64_t)n_tokens * n_groups * group_dim * sizeof(__half)) {
+        const uint64_t low_tmp_count = (uint64_t)n_groups * n_tokens * rank;
+        const uint64_t low_tmp_bytes = low_tmp_count * sizeof(float);
+        void *tmp = cuda_tmp_alloc(low_tmp_bytes, "attention output a strided");
+        if (!tmp) return 0;
+        float *low_packed = (float *)tmp;
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        const uint64_t head_stride = n_groups * group_dim;
+        cublasStatus_t st = cublasGemmStridedBatchedEx(g_cublas,
+                                                       CUBLAS_OP_T,
+                                                       CUBLAS_OP_N,
+                                                       (int)rank,
+                                                       (int)n_tokens,
+                                                       (int)group_dim,
+                                                       &alpha,
+                                                       out_a_f16,
+                                                       CUDA_R_16F,
+                                                       (int)group_dim,
+                                                       (long long)rank * group_dim,
+                                                       (const __half *)heads_f16->ptr,
+                                                       CUDA_R_16F,
+                                                       (int)head_stride,
+                                                       (long long)group_dim,
+                                                       &beta,
+                                                       low_packed,
+                                                       CUDA_R_32F,
+                                                       (int)rank,
+                                                       (long long)rank * n_tokens,
+                                                       (int)n_groups,
+                                                       CUDA_R_32F,
+                                                       CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "attention output a strided gemm")) return 0;
+        attention_unpack_group_low_kernel<<<(low_tmp_count + 255) / 256, 256>>>(
+                (float *)low->ptr,
+                low_packed,
+                n_tokens,
+                n_groups,
+                rank);
+        if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a unpack launch")) return 0;
+    } else if (out_a_f16) {
+        /* heads_f16 supplied by caller means the f32 heads buffer has NOT
+         * been inverse-roped (that work was folded into ds4_gpu_inv_rope_f16
+         * and lives only in heads_f16). Falling back to the packed-f32 path
+         * here would project pre-RoPE heads — silent numerical corruption.
+         * Refuse so the caller can fall back to its own f32+rope path. */
+        if (heads_f16) return 0;
         const uint64_t heads_h_count = (uint64_t)n_groups * n_tokens * group_dim;
         const uint64_t low_tmp_count = (uint64_t)n_groups * n_tokens * rank;
         const uint64_t heads_h_bytes = heads_h_count * sizeof(__half);
@@ -7684,6 +7789,10 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                 rank);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a unpack launch")) return 0;
     } else {
+        /* Same safety check as the cuBLAS-without-heads_f16 branch above:
+         * heads_f16 means the f32 heads buffer is pre-RoPE; native Q8 here
+         * would silently project wrong data. */
+        if (heads_f16) return 0;
         const uint64_t x_rows = (uint64_t)n_tokens * n_groups;
         const uint64_t xq_bytes = x_rows * blocks_a * 32u;
         const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;

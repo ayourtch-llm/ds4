@@ -1,6 +1,11 @@
-# ayourtch-may15 — cp.async + double-buffer for MoE gate_up: negative result
+# ayourtch-may15 — MoE gate_up + indexer experiments on GB10
 
-This is a **negative result writeup**. The experiment built a new
+Mostly negative results, with one positive outcome at the end (the
+combined gate+up dot helper, +6-8% prefill, see end of doc).
+
+## Original goal: push the MoE wall
+
+The experiment built a new
 double-buffered cp.async variant of the routed MoE gate/up kernel,
 benchmarked it on GB10 against the existing kernel, and confirmed
 that the existing kernel's natural per-thread overlap is hard to beat
@@ -327,14 +332,16 @@ MoE-side:
   (separate commit — required to build cp.async at all on this
   project's canonical build path)
 
-Indexer-side:
+Indexer-side: **none kept**. Experimental kernels were added then
+reverted (commit 5c1b00e reverts 3939b89). Only the analysis in this
+doc remains.
+
+Combined-helper win (committed separately, in commit d924746):
 - `ds4_cuda.cu`:
-  - new `g_indexer_q_f16` workspace + `cuda_refresh_indexer_q_f16()`
-  - new `indexer_scores_wmma128_f16q_kernel` (gated `DS4_CUDA_INDEXER_F16Q`)
-  - new `rope_tail_indexer_q_f16_kernel` (fused rope + f16 copy)
-  - new `ds4_gpu_rope_tail_indexer_q_tensor` wrapper
-- `ds4_gpu.h`: header decl for `ds4_gpu_rope_tail_indexer_q_tensor`
-- `ds4.c`: indexer Q rope call uses the new wrapper (no-op when env unset)
+  - new `dev_dot_iq2_xxs_q8_K_block8_gate_up_deq_lut` helper (fused gate+up dot)
+  - new `moe_gate_up_mid_expert_tile8_rowspan_combined_kernel<ROW_SPAN>`
+    (gated `DS4_CUDA_MOE_GATE_COMBINED`)
+  - env-gated dispatch in `routed_moe_gate_up`
 
 ## Reproducing
 
@@ -364,3 +371,76 @@ sudo /usr/local/cuda/bin/ncu \
 
 Raw nsys/ncu reports for the analysis are archived under `profiles/`
 on this branch.
+
+---
+
+## **Positive result: combined gate+up dot helper (+6-8% prefill)**
+
+After all the memory-bandwidth experiments came up neutral or
+negative, one more angle finally worked: **reduce the number of
+instructions issued per output**, not the number of bytes moved.
+
+The original MoE inner loop calls the dot helper *twice* per `b`
+iteration — once for the gate matrix, once for the up matrix:
+
+```c
+for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+    dev_dot_iq2_xxs_q8_K_block8_deq_lut(gr + b, xqb[0..7], np, gate, ...);
+    dev_dot_iq2_xxs_q8_K_block8_deq_lut(ur + b, xqb[0..7], np, up,   ...);
+}
+```
+
+Both calls read the SAME 8-token activations from SMEM, but they
+load them twice. The fix: a combined helper that takes both gate
+and up iq2 blocks, computes both dot products in one fused inner
+loop, and fans each activation int32 out to both dp4a chains:
+
+```c
+const int32_t a0 = *(const int32_t *)(q + 0);
+...
+const int32_t a7 = *(const int32_t *)(q + 28);
+sg = __dp4a(wg[0], a0, sg); su = __dp4a(wu[0], a0, su);
+sg = __dp4a(wg[1], a1, sg); su = __dp4a(wu[1], a1, su);
+...
+```
+
+Same SMEM, same warp layout, same access pattern, same occupancy
+(2 blocks/SM) — purely an instruction-count reduction in the
+innermost loop.
+
+| ctx | baseline (off) | DS4_CUDA_MOE_GATE_COMBINED=1 | Δ |
+|---:|---:|---:|---:|
+| 4096  | 409.5 | **442.0** | **+8.0%** |
+| 65536 | 355.3 | **376.5** | **+6.0%** |
+
+`make test` with the env var enabled: 1 failure (the pre-existing
+long-context "Alice 50 vs 52"), same as baseline. Codex (gpt-5.5)
+independently audited the helper and confirmed math equivalence to
+the original two-call sequence.
+
+### Why this worked (and the others didn't)
+
+Every previous experiment on this branch reduced **bytes per
+instruction** (f16 instead of f32, L1 bypass, fewer SMEM stages).
+ncu's "L1 throughput 82-90%" *looked* like that was the limiter.
+But each of those experiments produced no measurable win, suggesting
+something else was the wall.
+
+The combined helper reduces **instructions per output** instead.
+Specifically:
+- Half the function-call overhead in the `b` loop (1 call vs 2)
+- Half the activation-pointer dereferences per ib32 sub-block
+- The two dp4a chains can be scheduled in parallel by the warp
+  scheduler (same input register `a0..a7`, different weight registers
+  `wg[]` vs `wu[]`)
+
+That **directly attacks the LSU instruction-issue rate** which we
+hypothesized was the real bottleneck. The +6-8% empirical result
+confirms that hypothesis: instruction count was the wall, not byte
+bandwidth.
+
+This finding redirects future optimization on this kernel:
+
+- ❌ Bytes-per-instruction tricks (f16, L1 bypass) — won't help
+- ✅ **Instruction-count reductions** (combine ops, fewer loads,
+   tensor cores eventually) — this is the productive axis

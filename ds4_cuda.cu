@@ -66,6 +66,15 @@ typedef struct {
     uint16_t qs[CUDA_QK_K / 8];
 } cuda_block_iq2_xxs;
 
+// Compact q8_K (no bsums) for SMEM-cached activations in the cp.async MoE kernel.
+// Used only inside that kernel — full cuda_block_q8_K is unchanged everywhere else.
+// sizeof = 4 + 256 = 260 bytes (vs 292 for full); saves 32 B/block × 128 blocks = 4 KB
+// per CTA, just enough headroom to grow STAGE_ROWS from 28 to 30 for double-buffer.
+typedef struct {
+    float d;
+    int8_t qs[CUDA_QK_K];
+} cuda_block_q8_K_compact;
+
 #include "ds4_iq2_tables_cuda.inc"
 
 static const void *g_model_host_base;
@@ -8271,6 +8280,56 @@ __device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
     for (uint32_t p = 0; p < n; p++) acc[p] += 0.125f * xd * ys[p]->d * (float)bsum[p];
 }
 
+// Compact-q8_K variant: identical math, just skips the bsums field in struct layout.
+__device__ static void dev_dot_iq2_xxs_q8_K_compact_block8_deq_lut(
+        const cuda_block_iq2_xxs *x,
+        const cuda_block_q8_K_compact *y0,
+        const cuda_block_q8_K_compact *y1,
+        const cuda_block_q8_K_compact *y2,
+        const cuda_block_q8_K_compact *y3,
+        const cuda_block_q8_K_compact *y4,
+        const cuda_block_q8_K_compact *y5,
+        const cuda_block_q8_K_compact *y6,
+        const cuda_block_q8_K_compact *y7,
+        uint32_t n,
+        float acc[8],
+        const uint64_t *grid,
+        const uint8_t *signs) {
+    const float xd = dev_f16_to_f32(x->d);
+    const uint16_t *q2 = x->qs;
+    int32_t bsum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const int8_t *q8[8] = {
+        y0 ? y0->qs : NULL, y1 ? y1->qs : NULL, y2 ? y2->qs : NULL, y3 ? y3->qs : NULL,
+        y4 ? y4->qs : NULL, y5 ? y5->qs : NULL, y6 ? y6->qs : NULL, y7 ? y7->qs : NULL,
+    };
+    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
+        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        q2 += 4;
+        const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
+        int32_t w[8];
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
+        for (uint32_t p = 0; p < n; p++) {
+            const int8_t *q = q8[p] + ib32 * 32;
+            int32_t sumi = 0;
+            sumi = __dp4a(w[0], *(const int32_t *)(q + 0),  sumi);
+            sumi = __dp4a(w[1], *(const int32_t *)(q + 4),  sumi);
+            sumi = __dp4a(w[2], *(const int32_t *)(q + 8),  sumi);
+            sumi = __dp4a(w[3], *(const int32_t *)(q + 12), sumi);
+            sumi = __dp4a(w[4], *(const int32_t *)(q + 16), sumi);
+            sumi = __dp4a(w[5], *(const int32_t *)(q + 20), sumi);
+            sumi = __dp4a(w[6], *(const int32_t *)(q + 24), sumi);
+            sumi = __dp4a(w[7], *(const int32_t *)(q + 28), sumi);
+            bsum[p] += sumi * ls;
+        }
+    }
+    const cuda_block_q8_K_compact *ys[8] = { y0, y1, y2, y3, y4, y5, y6, y7 };
+    for (uint32_t p = 0; p < n; p++) acc[p] += 0.125f * xd * ys[p]->d * (float)bsum[p];
+}
+
 __device__ static void dev_dot_iq2_xxs_q8_K_block4(
         const cuda_block_iq2_xxs *x,
         const cuda_block_q8_K *y0,
@@ -9374,6 +9433,226 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
     }
 }
 
+// cp.async helpers (sm_80+; sm_121 has cp.async but no cp.async.bulk/TMA).
+// .cg variant caches at L2 only, bypassing L1 — used here to keep streamed
+// weight loads out of L1 so activation/LUT SMEM stays hot.
+__device__ __forceinline__ static void cp_async_16_cg(void *smem_dst, const void *global_src) {
+    uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                 :: "r"(smem_int_ptr), "l"(global_src));
+}
+
+__device__ __forceinline__ static void cp_async_commit_group() {
+    asm volatile("cp.async.commit_group;\n");
+}
+
+__device__ __forceinline__ static void cp_async_wait_all() {
+    asm volatile("cp.async.wait_all;\n");
+}
+
+// Double-buffered cp.async variant of moe_gate_up_mid_expert_tile8_rowspan_kernel.
+// Two SMEM stage buffers alternate: while one is being computed on, the other
+// is being filled by cp.async.cg (L2 → SMEM, bypass L1). Pipeline:
+//   prologue: load gate[0] into s_stage[0]
+//   per rr:   load up[rr] into the other buf; compute gate from this buf;
+//             load gate[rr+1] into this buf; compute up from other buf
+//   each load overlaps with one compute phase
+// STAGE_ROWS=28 instead of 32 because PerBlockOptin SMEM is 99 KB on GB10:
+// (full static caches 39.5 KB) + (2 stages × 28 rows × 1056 B = 59.1 KB) ≈ 98.7 KB.
+// Costs: 4 of 32 row_lanes idle per iter (~12.5% compute waste); 1024/28 doesn't
+// divide cleanly so the last rr handles a partial 12-row group.
+// Assumes xq_blocks == 16 (DeepSeek V4 Flash, d_model = 4096).
+template <uint32_t ROW_SPAN>
+__global__ static void moe_gate_up_mid_expert_tile8_rowspan_cpasync_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp) {
+    uint32_t tile = blockIdx.y;
+    if (tile >= *tile_total) return;
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row_lane = threadIdx.x >> 3u;
+    uint32_t expert = tile_experts[tile];
+    uint32_t local_start = tile_starts[tile];
+
+    __shared__ cuda_block_q8_K_compact sxq[8][16];   // 33,280 B (compact, no bsums)
+    __shared__ uint64_t s_iq2_grid[256];
+    __shared__ uint8_t s_iq2_signs[128];
+
+    // Two SMEM stages for double-buffered pipeline (load_next overlaps compute).
+    // Compact activations free ~4 KB → STAGE_ROWS=30 (was 28). 30 × 1056 × 2 = 63,360 B dynamic.
+    constexpr uint32_t STAGE_ROWS = 30u;
+    constexpr uint32_t ROW_BYTES = 16u * sizeof(cuda_block_iq2_xxs);   // 16 * 66 = 1056
+    constexpr uint32_t CHUNKS_PER_ROW = ROW_BYTES / 16u;               // 66
+    constexpr uint32_t STAGE_BYTES = STAGE_ROWS * ROW_BYTES;           // 29,568
+    extern __shared__ uint8_t s_stage_buf[];
+    uint8_t * const s_stage[2] = { s_stage_buf, s_stage_buf + STAGE_BYTES };
+
+    uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const cuda_block_q8_K *xqb_global[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+    const cuda_block_q8_K_compact *xqb[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+    uint32_t np = 0;
+    for (; np < 8u; np++) {
+        uint32_t local_pair = local_start + np;
+        if (local_pair >= counts[expert]) break;
+        pair[np] = sorted_pairs[offsets[expert] + local_pair];
+        tok[np] = pair[np] / n_expert;
+        slot[np] = pair[np] - tok[np] * n_expert;
+        xqb_global[np] = xq + (uint64_t)tok[np] * xq_blocks;
+    }
+    // Convert full q8_K activations (global) → compact (SMEM); skip bsums.
+    for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
+        uint32_t p = i / xq_blocks;
+        uint32_t b = i - p * xq_blocks;
+        const cuda_block_q8_K *src = xqb_global[p] + b;
+        sxq[p][b].d = src->d;
+        // qs[256] copied as 64 uint32_t for speed
+        const uint32_t *src_qs = reinterpret_cast<const uint32_t *>(src->qs);
+        uint32_t *dst_qs = reinterpret_cast<uint32_t *>(sxq[p][b].qs);
+        for (uint32_t k = 0; k < CUDA_QK_K / 4; k++) dst_qs[k] = src_qs[k];
+    }
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    __syncthreads();
+    for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
+
+    const char *expert_gate_base = gate_base + (uint64_t)expert * gate_expert_bytes;
+    const char *expert_up_base = up_base + (uint64_t)expert * gate_expert_bytes;
+
+    constexpr uint32_t N_RR = (ROW_SPAN + STAGE_ROWS - 1u) / STAGE_ROWS;  // 1024/28 ⇒ 37 (last partial)
+
+    // ===== Prologue: prefetch gate[rr=0] into s_stage[0] =====
+    {
+        uint32_t row_base = blockIdx.x * ROW_SPAN;
+        for (uint32_t i = threadIdx.x; i < STAGE_ROWS * CHUNKS_PER_ROW; i += blockDim.x) {
+            uint32_t r = i / CHUNKS_PER_ROW;
+            uint32_t c = i - r * CHUNKS_PER_ROW;
+            uint32_t load_row = row_base + r;
+            uint8_t *dst = &s_stage[0][r * ROW_BYTES + c * 16u];
+            if (load_row < expert_mid_dim) {
+                const uint8_t *src = (const uint8_t *)(expert_gate_base + (uint64_t)load_row * gate_row_bytes) + c * 16u;
+                cp_async_16_cg(dst, src);
+            } else {
+                *reinterpret_cast<uint4 *>(dst) = make_uint4(0, 0, 0, 0);
+            }
+        }
+        cp_async_commit_group();
+        cp_async_wait_all();
+        __syncthreads();
+    }
+
+    for (uint32_t rr = 0; rr < N_RR; rr++) {
+        uint32_t row_base = blockIdx.x * ROW_SPAN + rr * STAGE_ROWS;
+        uint32_t row = row_base + row_lane;
+        uint32_t gate_buf = rr & 1u;            // gate of rr lives here (loaded on prev iter or prologue)
+        uint32_t up_buf = 1u - gate_buf;        // up of rr will be loaded here
+
+        // ===== Issue async load of up[rr] into s_stage[up_buf] =====
+        for (uint32_t i = threadIdx.x; i < STAGE_ROWS * CHUNKS_PER_ROW; i += blockDim.x) {
+            uint32_t r = i / CHUNKS_PER_ROW;
+            uint32_t c = i - r * CHUNKS_PER_ROW;
+            uint32_t load_row = row_base + r;
+            uint8_t *dst = &s_stage[up_buf][r * ROW_BYTES + c * 16u];
+            if (load_row < expert_mid_dim) {
+                const uint8_t *src = (const uint8_t *)(expert_up_base + (uint64_t)load_row * gate_row_bytes) + c * 16u;
+                cp_async_16_cg(dst, src);
+            } else {
+                *reinterpret_cast<uint4 *>(dst) = make_uint4(0, 0, 0, 0);
+            }
+        }
+        cp_async_commit_group();
+
+        // ===== Compute gate dots from s_stage[gate_buf] (data already loaded) =====
+        float gate[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        if (row_lane < STAGE_ROWS && (rr * STAGE_ROWS + row_lane) < ROW_SPAN && row < expert_mid_dim) {
+            const cuda_block_iq2_xxs *gr_smem = reinterpret_cast<const cuda_block_iq2_xxs *>(&s_stage[gate_buf][(uint64_t)row_lane * ROW_BYTES]);
+            for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+                dev_dot_iq2_xxs_q8_K_compact_block8_deq_lut(gr_smem + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
+                                                            xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
+                                                            xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
+                                                            xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, gate,
+                                                            s_iq2_grid, s_iq2_signs);
+            }
+        }
+        cp_async_wait_all();
+        __syncthreads();
+
+        // ===== Issue async load of gate[rr+1] into s_stage[gate_buf] (overlap with up compute) =====
+        if (rr + 1u < N_RR) {
+            uint32_t next_row_base = blockIdx.x * ROW_SPAN + (rr + 1u) * STAGE_ROWS;
+            for (uint32_t i = threadIdx.x; i < STAGE_ROWS * CHUNKS_PER_ROW; i += blockDim.x) {
+                uint32_t r = i / CHUNKS_PER_ROW;
+                uint32_t c = i - r * CHUNKS_PER_ROW;
+                uint32_t load_row = next_row_base + r;
+                uint8_t *dst = &s_stage[gate_buf][r * ROW_BYTES + c * 16u];
+                if (load_row < expert_mid_dim) {
+                    const uint8_t *src = (const uint8_t *)(expert_gate_base + (uint64_t)load_row * gate_row_bytes) + c * 16u;
+                    cp_async_16_cg(dst, src);
+                } else {
+                    *reinterpret_cast<uint4 *>(dst) = make_uint4(0, 0, 0, 0);
+                }
+            }
+            cp_async_commit_group();
+        }
+
+        // ===== Compute up dots from s_stage[up_buf] =====
+        float up[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        if (row_lane < STAGE_ROWS && (rr * STAGE_ROWS + row_lane) < ROW_SPAN && row < expert_mid_dim) {
+            const cuda_block_iq2_xxs *ur_smem = reinterpret_cast<const cuda_block_iq2_xxs *>(&s_stage[up_buf][(uint64_t)row_lane * ROW_BYTES]);
+            for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+                dev_dot_iq2_xxs_q8_K_compact_block8_deq_lut(ur_smem + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
+                                                            xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
+                                                            xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
+                                                            xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up,
+                                                            s_iq2_grid, s_iq2_signs);
+            }
+        }
+        if (rr + 1u < N_RR) {
+            cp_async_wait_all();
+            __syncthreads();
+        }
+
+        // ===== Reduce + write =====
+        if (row_lane < STAGE_ROWS && (rr * STAGE_ROWS + row_lane) < ROW_SPAN && row < expert_mid_dim) {
+            for (uint32_t p = 0; p < np; p++) {
+                gate[p] = quarter_warp_sum_f32(gate[p], lane);
+                up[p] = quarter_warp_sum_f32(up[p], lane);
+                if (lane == 0) {
+                    if (clamp > 1.0e-6f) {
+                        if (gate[p] > clamp) gate[p] = clamp;
+                        if (up[p] > clamp) up[p] = clamp;
+                        if (up[p] < -clamp) up[p] = -clamp;
+                    }
+                    const uint64_t off = (uint64_t)pair[p] * expert_mid_dim + row;
+                    if (write_aux) {
+                        gate_out[off] = gate[p];
+                        up_out[off] = up[p];
+                    }
+                    mid_out[off] = (gate[p] / (1.0f + expf(-gate[p]))) * up[p] * weights[(uint64_t)tok[p] * n_expert + slot[p]];
+                }
+            }
+        }
+    }
+}
+
 __global__ static void moe_gate_up_mid_sorted_p2_qwarp32_kernel(
         float *gate_out,
         float *up_out,
@@ -10345,6 +10624,8 @@ static int routed_moe_launch(
         const uint32_t gate_row_span =
             getenv("DS4_CUDA_MOE_GATE_ROW512") != NULL ? 512u :
             getenv("DS4_CUDA_MOE_GATE_ROW2048") != NULL ? 2048u : 1024u;
+        const uint32_t use_gate_cpasync =
+            getenv("DS4_CUDA_MOE_GATE_CPASYNC") != NULL && xq_blocks == 16u && gate_row_span == 1024u;
         const uint32_t down_row_span =
             getenv("DS4_CUDA_MOE_DOWN_ROW512") != NULL ? 512u :
             getenv("DS4_CUDA_MOE_DOWN_ROW1024") != NULL ? 1024u : 2048u;
@@ -10472,12 +10753,29 @@ static int routed_moe_launch(
                             write_gate_up, clamp);
                     } else if (gate_row_span == 1024u) {
                         dim3 tgrid((expert_mid_dim + 1023u) / 1024u, tile_capacity, 1);
-                        moe_gate_up_mid_expert_tile8_rowspan_kernel<1024><<<tgrid, 256>>>(
-                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
-                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                            write_gate_up, clamp);
+                        if (use_gate_cpasync) {
+                            constexpr int CPASYNC_SMEM_BYTES = 2 * 30 * 16 * (int)sizeof(cuda_block_iq2_xxs); // 2 stages × 30 rows × 16 blocks × 66 = 63,360
+                            static int cpasync_attr_set = 0;
+                            if (!cpasync_attr_set) {
+                                (void)cudaFuncSetAttribute(
+                                    (const void *)moe_gate_up_mid_expert_tile8_rowspan_cpasync_kernel<1024>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, CPASYNC_SMEM_BYTES);
+                                cpasync_attr_set = 1;
+                            }
+                            moe_gate_up_mid_expert_tile8_rowspan_cpasync_kernel<1024><<<tgrid, 256, CPASYNC_SMEM_BYTES>>>(
+                                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                                gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                write_gate_up, clamp);
+                        } else {
+                            moe_gate_up_mid_expert_tile8_rowspan_kernel<1024><<<tgrid, 256>>>(
+                                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                                gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
+                                tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                write_gate_up, clamp);
+                        }
                     } else {
                         dim3 tgrid((expert_mid_dim + 2047u) / 2048u, tile_capacity, 1);
                         moe_gate_up_mid_expert_tile8_row2048_kernel<<<tgrid, 256>>>(

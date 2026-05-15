@@ -1549,6 +1549,31 @@ extern "C" int ds4_gpu_sync_async(void) {
     (void)cudaStreamSynchronize(g_async_stream);
     return 1;
 }
+extern "C" int ds4_gpu_preallocate_async(uint64_t max_f16_elems, uint64_t max_scratch_bytes) {
+    if (!g_async_ready) return 1;
+    const uint64_t xh_bytes = max_f16_elems * sizeof(__half);
+    if (g_xh_async_bytes < xh_bytes) {
+        if (g_xh_async_buf) { (void)cudaFree(g_xh_async_buf); g_xh_async_buf = NULL; }
+        void *ptr = NULL;
+        if (cudaMalloc(&ptr, (size_t)xh_bytes) != cudaSuccess) {
+            g_xh_async_bytes = 0;
+            return 0;
+        }
+        g_xh_async_buf = (__half *)ptr;
+        g_xh_async_bytes = xh_bytes;
+    }
+    if (g_cuda_tmp_async_bytes < max_scratch_bytes) {
+        if (g_cuda_tmp_async) { (void)cudaFree(g_cuda_tmp_async); g_cuda_tmp_async = NULL; }
+        void *ptr = NULL;
+        if (cudaMalloc(&ptr, (size_t)max_scratch_bytes) != cudaSuccess) {
+            g_cuda_tmp_async_bytes = 0;
+            return 0;
+        }
+        g_cuda_tmp_async = ptr;
+        g_cuda_tmp_async_bytes = max_scratch_bytes;
+    }
+    return 1;
+}
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }

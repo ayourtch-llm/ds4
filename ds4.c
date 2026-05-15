@@ -8845,6 +8845,16 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_routed_down = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
     g->batch_routed_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
 
+    {
+        const uint64_t async_max_dim = DS4_N_EMBD > shared_dim ? DS4_N_EMBD : shared_dim;
+        const uint64_t async_f16_elems = pc * async_max_dim;
+        const uint64_t async_blocks = (async_max_dim + 31u) / 32u;
+        const uint64_t async_xq_bytes = pc * async_blocks * 32u;
+        const uint64_t async_scale_off = (async_xq_bytes + 15u) & ~15ull;
+        const uint64_t async_scratch = async_scale_off + pc * async_blocks * sizeof(float);
+        ds4_gpu_preallocate_async(async_f16_elems, async_scratch);
+    }
+
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
         layer_cache_ok = g->layer_raw_cache[il] != NULL;

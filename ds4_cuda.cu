@@ -10968,9 +10968,13 @@ static int routed_moe_launch(
             getenv("DS4_CUDA_MOE_GATE_CPASYNC") != NULL && xq_blocks == 16u && gate_row_span == 1024u;
         const uint32_t use_gate_ldcg =
             !use_gate_cpasync && getenv("DS4_CUDA_MOE_GATE_LDCG") != NULL && gate_row_span == 1024u;
+        // Combined gate+up dot helper: default-on when the gate_row_span=1024 path
+        // is selected (i.e. the rowspan kernel is in use). +5.4-6.8% prefill across
+        // the 2K-65K ctx range vs the two-call original. Disable via DS4_CUDA_MOE_NO_GATE_COMBINED.
         const uint32_t use_gate_combined =
             !use_gate_cpasync && !use_gate_ldcg &&
-            getenv("DS4_CUDA_MOE_GATE_COMBINED") != NULL && gate_row_span == 1024u;
+            gate_row_span == 1024u &&
+            getenv("DS4_CUDA_MOE_NO_GATE_COMBINED") == NULL;
         const uint32_t down_row_span =
             getenv("DS4_CUDA_MOE_DOWN_ROW512") != NULL ? 512u :
             getenv("DS4_CUDA_MOE_DOWN_ROW1024") != NULL ? 1024u : 2048u;

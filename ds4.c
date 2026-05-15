@@ -11240,23 +11240,27 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("q_a_norm");
-    /* Quality mode disables the f16 Q8 weight cache, leaving the f16-out
-     * matmul without a usable weight pointer or fallback. Also keep this
-     * path off for short prefills where cuBLAS f16-out kernel selection
-     * regresses throughput and the reduced Q precision shifts top-token
-     * choices on already-borderline short prompts. */
-    if (ok && !g->quality && n_tokens >= 2048 && g->batch_q_f16 &&
-        getenv("DS4_CUDA_NO_Q_F16") == NULL) {
-        ok = ds4_gpu_matmul_q8_0_f16out_tensor(g->batch_q_f16,
-                                                  model->map,
-                                                  model->size,
-                                                  layer->attn_q_b->abs_offset,
-                                                  q_rank,
-                                                  q_dim,
-                                                  g->batch_qr_norm,
-                                                  n_tokens) != 0;
-        DS4_METAL_PROFILE_Q_STAGE("q_b_f16");
-        if (ok) ok = ds4_gpu_head_rms_norm_rope_tail_f16in_tensor(g->batch_q,
+    /* Try f16 Q path: cuBLAS f16 output + fused norm/rope from f16 input.
+     * Requires q8 f16 weight cache (unavailable in quality mode or when
+     * GPU memory budget is exhausted). Gate on n_tokens >= 2048 where the
+     * f16-out kernel actually wins; short prefills regress throughput and
+     * shift top-token choices on borderline prompts. Fall back to f32 if
+     * the f16 matmul fails (e.g. weight cache unavailable). */
+    {
+        int q_f16_ok = 0;
+        if (ok && !g->quality && n_tokens >= 2048 && g->batch_q_f16 &&
+            getenv("DS4_CUDA_NO_Q_F16") == NULL) {
+            q_f16_ok = ds4_gpu_matmul_q8_0_f16out_tensor(g->batch_q_f16,
+                                                            model->map,
+                                                            model->size,
+                                                            layer->attn_q_b->abs_offset,
+                                                            q_rank,
+                                                            q_dim,
+                                                            g->batch_qr_norm,
+                                                            n_tokens);
+            if (q_f16_ok) {
+                DS4_METAL_PROFILE_Q_STAGE("q_b_f16");
+                ok = ds4_gpu_head_rms_norm_rope_tail_f16in_tensor(g->batch_q,
                                                                      g->batch_q_f16,
                                                                      n_tokens,
                                                                      DS4_N_HEAD,
@@ -11272,8 +11276,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                      DS4_ROPE_YARN_BETA_FAST,
                                                                      DS4_ROPE_YARN_BETA_SLOW,
                                                                      DS4_RMS_EPS) != 0;
-        DS4_METAL_PROFILE_Q_STAGE("norm_rope_f16in");
-    } else if (ok) {
+                DS4_METAL_PROFILE_Q_STAGE("norm_rope_f16in");
+            }
+        }
+        if (ok && !q_f16_ok) {
         ok = ds4_gpu_matmul_q8_0_tensor(g->batch_q,
                                           model->map,
                                           model->size,
@@ -11304,6 +11310,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                 DS4_ROPE_YARN_BETA_FAST,
                                                 DS4_ROPE_YARN_BETA_SLOW) != 0;
         DS4_METAL_PROFILE_Q_STAGE("rope");
+        }
     }
     if (ok) {
         metal_graph_debug_dump_tensor("Qcur", g->batch_q,

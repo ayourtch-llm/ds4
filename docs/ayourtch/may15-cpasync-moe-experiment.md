@@ -121,78 +121,139 @@ Turing-baseline PTX that JITs at load time.
 
 ## Why it didn't work
 
-Walking through what each intermediate prototype told us:
+Walking through what each prototype told us:
 
 | Variant | 4K prefill | vs baseline | what it confirms |
 |---|---:|---:|---|
-| original | 417.45 | — | baseline |
-| single-buffer cp.async, STAGE_ROWS=32 | 384.84 | -7.8% | cooperative load + sync wait is **strictly worse** than per-thread async-via-scheduler |
-| double-buffer, STAGE_ROWS=28 | 355.79 | -14.8% | overlap recovers some, but STAGE_ROWS=28 idle penalty (~12.5%) dominates |
-| double-buffer, STAGE_ROWS=30 + compact | 380.95 | -8.7% | each row of STAGE_ROWS = ~3% perf; extrapolated STAGE_ROWS=32 would be ~-3 to -5% — still loss |
+| original | 418.72 | — | baseline |
+| single-buffer cp.async, STAGE_ROWS=32 | 384.84 | -7.6% | cooperative load + sync wait is strictly worse than per-thread async-via-scheduler |
+| double-buffer cp.async, STAGE_ROWS=28 | 355.79 | -15.0% | overlap recovers some, but STAGE_ROWS=28 idle penalty (~12.5%) dominates |
+| double-buffer cp.async, STAGE_ROWS=30 + compact | 380.95 | -9.0% | each row of STAGE_ROWS ≈ 3% perf; extrapolated STAGE_ROWS=32 would be ~-3 to -5%, still a loss |
+| `__ldcg` only (preserves occupancy, no SMEM staging) | 341.18 | **-18.5%** | bypassing L1 with original SMEM footprint is even worse — every load takes L2 latency |
 
-The pattern is clean: each row added to `STAGE_ROWS` recovers ~3%,
-implying STAGE_ROWS=32 with double-buffer would land around -3 to
--5%. Not a win.
+### Mechanism, take 2: the real bottleneck is *occupancy*, not bandwidth
 
-### Mechanism: what the data actually says
+A side-by-side ncu profile of the cp.async double-buffer kernel vs
+the original (both at 4K prefill, one launch each) reveals what
+actually happens. Key numbers:
 
-`L1 sector waste = 52%` *sounds* like a bandwidth problem cp.async
-fixes, but the kernel isn't capacity-bound on L1 sectors. The L1
-throughput metric measures **pipeline busy**, not cache capacity.
-Replacing per-thread `ld.global` (cached in L1) with cooperative
-`cp.async.cg` (bypass L1, write to SMEM) doesn't reduce LSU work and
-loses the per-thread scheduler-level overlap the original kernel
-gets for free. The original kernel's warp scheduler, with 4 row_lanes
-× 8 dot_lanes × 8 warps issuing thousands of independent
-small loads, already hides L2 latency in a way our barrier-on-load
-model can't match.
+| Metric | Original | cp.async DB |
+|---|---:|---:|
+| Duration | 44.53 ms | 60.00 ms (+35%) |
+| L1/TEX Throughput | 89.99% | 73.00% |
+| L1 Hit Rate | 74.15% | 19.64% |
+| L2 Throughput | 39.37% | 6.58% |
+| L2 Hit Rate | 95.84% | 84.30% |
+| Mem Pipes Busy | 88.40% | 72.71% |
+| Compute (SM) Throughput | 88.99% | 72.65% |
+| **Achieved Occupancy** | **32.95%** | **16.46%** |
+| Active warps/scheduler | 4.09 | 2.00 |
+| "No eligible warp" cycles | 54.13% | 61.04% |
+| Block Limit (SMEM) | 2/SM | 1/SM |
 
-The 54% "no eligible warp" cycles **is** a latency-hiding problem,
-but it's already being hidden — just not at zero cost. Our cp.async
-model trades that "natural hiding" for an explicit barrier that
-turns out to be more expensive.
+**The cp.async kernel ran correctly** — L1 throughput dropped (the
+bypass works), no barrier stall (`L2 active / SM active = 63%`
+means SMs are *not* sitting in `wait_all`). Double-buffer smoothed
+the latency.
 
-The L1 hit rate of 74% also matters more than the sector waste did:
-under the original kernel, ~74% of weight reads hit L1 at ~30 cycle
-latency. Bypassing L1 sends 100% of reads to L2 at ~200 cycle
-latency. The per-load average latency *increased*, not decreased.
+**But two stages cost ~64 KB dynamic SMEM, which forces 1 block/SM
+instead of 2.** Once occupancy halves, every downstream metric
+collapses with it:
+
+1. **Half the warps per scheduler** (2.00 vs 4.09) → less ILP for
+   the scheduler to chew on while individual warps wait.
+2. **Half the concurrent CTAs across the chip** (48 vs 96) →
+   roughly half the chance that two same-expert CTAs (placed
+   adjacent by `sorted_pairs`) overlap in time. **That's what
+   collapses L2 hit rate from 96% to 84%.**
+
+   The cross-CTA L2 reuse the original kernel "got for free" from
+   high occupancy is a hidden lever the metric-level analysis
+   missed.
+3. **More idle cycles** (61% no-eligible vs 54%) → consequence of
+   1+2.
+
+So double-buffer works as advertised; cooperative cp.async works as
+advertised. The cost was just in a place we weren't measuring:
+*occupancy preservation*.
+
+### Why `__ldcg` alone was even worse
+
+The `__ldcg` variant kept the original SMEM footprint (preserving 2
+blocks/SM) and only changed weight reads to bypass L1. Result:
+**-18.5%**, the worst of all variants. Reason: the original
+kernel's **L1 hit rate of 74% isn't waste, it's a fast path** at
+~30 cycle latency. `__ldcg` forces all reads to L2 at ~200 cycle
+latency. Average per-load latency triples. The kernel is bound on
+*scheduler-can't-find-eligible-warps*; slowing every load makes
+that strictly worse, even with occupancy preserved.
+
+### The real lesson
+
+The original kernel sits at a **multi-axis sweet spot**:
+- L1 cache catches inter-thread sector reuse → 74% hit rate at ~30
+  cycle latency
+- Occupancy at 2 blocks/SM → 96 concurrent CTAs → cross-CTA L2
+  reuse → 96% L2 hit rate
+- Warp scheduler hides L2 misses across 4 active warps/scheduler
+
+Any change that improves one axis at the cost of another loses
+because all three are simultaneously near-binding. cp.async fixed
+L1 sector waste but broke occupancy. `__ldcg` preserved occupancy
+but broke L1's fast path. There is no obvious axis to improve in
+isolation.
 
 ## Lessons / what to try next
 
-The MoE wall is still there. cp.async + double-buffer is not the
-lever on this kernel. Things still worth trying, in rough
-likelihood-of-helping order:
+The MoE wall is still there. Memory-access reshuffling is not the
+lever on this kernel. The three-way sweet spot (L1 hit rate ×
+occupancy × warp-scheduler overlap) is too tightly coupled to
+improve one axis without losing on the others.
+
+Directions still worth trying, biased toward changes that
+**reduce total work** rather than redistribute existing work:
 
 1. **Co-encode gate + up weights into one packed stream.** Each row
-   of gate and up is read together every time; if they were
-   interleaved in a single iq2-style format with one shared LUT
-   lookup decoding both gate and up values per 2-bit code, weight
-   bandwidth halves. Requires a custom GGUF format and re-quantizing
-   the model — but the bandwidth savings are real (not a
-   pipeline-vs-pipeline trade like cp.async was).
+   of gate and up is read together every time; if they were jointly
+   quantized into a single iq2-style format whose 2-bit code indexes
+   into a shared LUT of (gate, up) value pairs, weight bandwidth
+   halves. Requires a new GGUF format and re-quantizing the model,
+   but the bytes-per-output reduction is real and orthogonal to the
+   cache effects this experiment hit a wall on.
 2. **FP8 mma.sync at the inner GEMM.** Dequantize iq2_xxs → FP8 in
-   SMEM (small tile), issue `mma.sync.aligned.m16n8k32.row.col.f8...`
-   instructions. ~16× FP32 scalar throughput on tensor cores. Helps
-   only if it relieves the LSU/scheduler enough that memory becomes
-   the *only* bottleneck — currently compute and memory are
-   co-saturated.
-3. **Restructure the warp layout** to 16 row_lanes × 16 dot_lanes
-   (one block per dot_lane), making per-warp SMEM reads naturally
-   coalesce on 16-byte boundaries. Needs a new single-block dot
-   helper and is invasive, but is the only path that actually
-   addresses the *structural* cause of L1 sector waste.
+   SMEM (small tile), issue `mma.sync.aligned.m16n8k32...f8...`
+   instructions. Each mma replaces many `__dp4a` issues per thread;
+   could relieve the compute side enough that memory becomes the
+   sole bottleneck (currently both are at 89% co-saturation in the
+   original kernel). Doesn't change byte traffic, but changes
+   instruction count and warp-issue cost.
+3. **Different kernel entirely.** The indexer pipeline
+   (`indexer_scores_wmma128_kernel` + `attention_indexed_mixed_*`)
+   was ~22% of long-ctx prefill time with high per-call variance
+   — fresh territory with no analysis yet.
 4. **Custom persistent CTAs** that hold expert weights resident in
    L2/SMEM across multiple tile batches, amortizing the per-CTA
-   weight read.
+   weight read. Direct attack on the **cross-CTA L2 reuse** that
+   this experiment showed is critical (and that any naive
+   occupancy-reducing change destroys).
+
+What is *not* worth retrying (this experiment establishes it):
+- Bypassing L1 with `__ldcg` (loses fast-path latency, worse net)
+- Cooperative cp.async with smaller activation cache (would just
+  shift the SMEM tax onto activation reuse, same occupancy hit)
+- Restructuring warp layout for coalesced SMEM loads — only useful
+  if the SMEM staging path turned out to win, which it didn't
 
 ## Files touched (this experiment)
 
 - `ds4_cuda.cu`:
   - new `cuda_block_q8_K_compact` struct
   - new `dev_dot_iq2_xxs_q8_K_compact_block8_deq_lut` helper
+  - new `dev_dot_iq2_xxs_q8_K_block8_deq_lut_ldcg` helper
   - new `cp_async_16_cg / cp_async_commit_group / cp_async_wait_all` PTX wrappers
-  - new `moe_gate_up_mid_expert_tile8_rowspan_cpasync_kernel<ROW_SPAN>`
-  - new `use_gate_cpasync` env-gated dispatch in `routed_moe_gate_up`
+  - new `moe_gate_up_mid_expert_tile8_rowspan_cpasync_kernel<ROW_SPAN>` (gated `DS4_CUDA_MOE_GATE_CPASYNC`)
+  - new `moe_gate_up_mid_expert_tile8_rowspan_ldcg_kernel<ROW_SPAN>` (gated `DS4_CUDA_MOE_GATE_LDCG`)
+  - env-gated dispatch in `routed_moe_gate_up`
 - `Makefile`: `cuda-spark` target now passes `CUDA_ARCH=sm_121`
   (separate commit — required to build cp.async at all on this
   project's canonical build path)

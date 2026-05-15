@@ -243,9 +243,78 @@ What is *not* worth retrying (this experiment establishes it):
   shift the SMEM tax onto activation reuse, same occupancy hit)
 - Restructuring warp layout for coalesced SMEM loads — only useful
   if the SMEM staging path turned out to win, which it didn't
+- Halving Q bandwidth in the indexer kernel (either standalone f32→f16
+  conversion or fused into rope_tail) — confirmed twice that the
+  82% L1 throughput reading isn't the wall-clock bottleneck
+
+**Important meta-observation:** ncu's memory-throughput metrics keep
+pointing at "pegged" pipelines (L1 at 82-90% on both MoE and indexer
+kernels) but reducing those by half produces only ~1.4% wall-clock
+improvement. The actual limiter for wmma/dp4a kernels on GB10
+appears to be **per-instruction issue cost** in the LSU / scheduler,
+not byte throughput. Future experiments should focus on **reducing
+the number of memory instructions issued** (vectorized loads,
+ldmatrix.sync, fewer total loads via larger tiles) rather than
+reducing bytes per instruction.
+
+## Follow-on investigation: indexer scores kernel (analysis kept, code discarded)
+
+After concluding the MoE path was exhausted, the indexer scores
+pipeline (`indexer_scores_wmma128_kernel`, ~9.2% of 64K prefill,
+~17 s of 187 s total) became the next target. The kernel reads Q as
+f32 in its per-head load loop and converts to f16 inside the kernel;
+Q is ~88% of the per-CTA memory traffic.
+
+Profile snapshot at ctx=16K (`ncu --replay-mode application --set basic`):
+
+| Metric | Value | Reading |
+|--------|------:|---------|
+| Duration | 2.83 ms | one call |
+| Memory Throughput | 81.6% | high |
+| L1/TEX Throughput | 82.8% | high |
+| L2 Throughput | 8.6% | low — most reads stay in L1 |
+| Compute (SM) Throughput | 14.1% | low — tons of headroom |
+| Achieved Occupancy | 32% | 2 blocks/SM |
+
+Looked like a textbook "halve Q bandwidth" target. Four prototypes
+were built and benched; none were kept in code:
+
+| Variant | 4K | 64K | Net |
+|---|---:|---:|---|
+| baseline | ~419 | ~357 | — |
+| f16-Q via separate f32→f16 conversion kernel | -1.2% | -1.2% | regression |
+| f16-Q fused into rope_tail | +0.2% (noise) | ±0.0% (noise) | neutral |
+| `float4` vectorized Q/index_comp loads (codex) | +0.26% (noise) | -0.48% | within noise |
+| Drop per-head accumulation `__syncthreads` | (noise) | (skipped) | regression at 4K |
+
+Per-kernel ncu on the f16q variant did show the expected effect:
+L1 throughput dropped 82.8% → 69.8%, kernel duration 2.83 → 2.79 ms.
+The L1 bypass works as designed. **But the kernel only ran 1.4%
+faster.** That means L1 throughput at 82% was *not* the wall-clock
+bottleneck — again. Even the architecturally clean fused-into-rope
+path (no standalone f32 re-read) produced no measurable bench win.
+
+Same shape of problem as the MoE: the ncu memory-throughput metrics
+show a peg, but the actual wall-clock limiter is something else
+(likely LSU instruction issue rate — same load count, smaller bytes,
+no improvement). **This is now a confirmed *pattern* across two
+different kernels.**
+
+Codex (gpt-5.5 xhigh) independently reached the same conclusion in a
+40-minute follow-up review, after also benching its own `float4`
+vectorized-load variant. Codex's residual suggestion for future work:
+eliminate the `wmma::store_matrix_sync(c_sh)` SMEM roundtrip and the
+subsequent shared-memory re-read for the per-head accumulation — that
+attacks *shared* LSU traffic and barriers, not global bytes. This
+would require inline `mma.sync` with manual fragment-to-thread layout
+and is a larger restructure than the current branch took on.
+
+**None of the indexer-side experimental kernels are kept on this
+branch.** The analysis is preserved here; the code was reverted.
 
 ## Files touched (this experiment)
 
+MoE-side:
 - `ds4_cuda.cu`:
   - new `cuda_block_q8_K_compact` struct
   - new `dev_dot_iq2_xxs_q8_K_compact_block8_deq_lut` helper
@@ -257,6 +326,15 @@ What is *not* worth retrying (this experiment establishes it):
 - `Makefile`: `cuda-spark` target now passes `CUDA_ARCH=sm_121`
   (separate commit — required to build cp.async at all on this
   project's canonical build path)
+
+Indexer-side:
+- `ds4_cuda.cu`:
+  - new `g_indexer_q_f16` workspace + `cuda_refresh_indexer_q_f16()`
+  - new `indexer_scores_wmma128_f16q_kernel` (gated `DS4_CUDA_INDEXER_F16Q`)
+  - new `rope_tail_indexer_q_f16_kernel` (fused rope + f16 copy)
+  - new `ds4_gpu_rope_tail_indexer_q_tensor` wrapper
+- `ds4_gpu.h`: header decl for `ds4_gpu_rope_tail_indexer_q_tensor`
+- `ds4.c`: indexer Q rope call uses the new wrapper (no-op when env unset)
 
 ## Reproducing
 

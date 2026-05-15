@@ -73,7 +73,7 @@ help:
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
-	$(MAKE) ds4 ds4-server ds4-bench CUDA_ARCH=
+	$(MAKE) ds4 ds4-server ds4-bench CUDA_ARCH=sm_121
 
 cuda-generic:
 	$(MAKE) ds4 ds4-server ds4-bench CUDA_ARCH=native

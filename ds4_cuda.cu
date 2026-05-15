@@ -155,10 +155,14 @@ static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
 static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
+static void *g_cuda_tmp_async;
+static uint64_t g_cuda_tmp_async_bytes;
 static __half *g_xh_cache;
 static uint64_t g_xh_cache_bytes;
 static const float *g_xh_cache_src;
 static uint64_t g_xh_cache_count;
+static __half *g_xh_async_buf;
+static uint64_t g_xh_async_bytes;
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -186,11 +190,13 @@ __global__ static void dequant_q8_0_to_f32_kernel(
 
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
-    if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
-    if (g_cuda_tmp) {
-        (void)cudaFree(g_cuda_tmp);
-        g_cuda_tmp = NULL;
-        g_cuda_tmp_bytes = 0;
+    void **buf = (g_active_stream != 0) ? &g_cuda_tmp_async : &g_cuda_tmp;
+    uint64_t *buf_bytes = (g_active_stream != 0) ? &g_cuda_tmp_async_bytes : &g_cuda_tmp_bytes;
+    if (*buf_bytes >= bytes) return *buf;
+    if (*buf) {
+        (void)cudaFree(*buf);
+        *buf = NULL;
+        *buf_bytes = 0;
     }
     void *ptr = NULL;
     cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
@@ -200,19 +206,34 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
         (void)cudaGetLastError();
         return NULL;
     }
-    g_cuda_tmp = ptr;
-    g_cuda_tmp_bytes = bytes;
-    return g_cuda_tmp;
+    *buf = ptr;
+    *buf_bytes = bytes;
+    return *buf;
 }
 
 static uint64_t g_xh_cache_hits, g_xh_cache_misses;
 static __half *cuda_get_f16_activations(const float *src, uint64_t count) {
+    const uint64_t bytes = count * sizeof(__half);
+    if (g_active_stream != 0) {
+        if (g_xh_async_bytes < bytes) {
+            if (g_xh_async_buf) { (void)cudaFree(g_xh_async_buf); g_xh_async_buf = NULL; }
+            void *ptr = NULL;
+            if (cudaMalloc(&ptr, (size_t)bytes) != cudaSuccess) {
+                g_xh_async_bytes = 0;
+                return NULL;
+            }
+            g_xh_async_buf = (__half *)ptr;
+            g_xh_async_bytes = bytes;
+        }
+        f32_to_f16_kernel<<<(count + 255) / 256, 256, 0, g_active_stream>>>(g_xh_async_buf, src, count);
+        if (cudaGetLastError() != cudaSuccess) return NULL;
+        return g_xh_async_buf;
+    }
     if (src == g_xh_cache_src && count == g_xh_cache_count && g_xh_cache) {
         g_xh_cache_hits++;
         return g_xh_cache;
     }
     g_xh_cache_misses++;
-    const uint64_t bytes = count * sizeof(__half);
     if (g_xh_cache_bytes < bytes) {
         if (g_xh_cache) { (void)cudaFree(g_xh_cache); g_xh_cache = NULL; }
         void *ptr = NULL;
@@ -1318,6 +1339,11 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
     }
+    if (g_cuda_tmp_async) {
+        (void)cudaFree(g_cuda_tmp_async);
+        g_cuda_tmp_async = NULL;
+        g_cuda_tmp_async_bytes = 0;
+    }
     if (g_xh_cache) {
         if (g_xh_cache_hits + g_xh_cache_misses > 0)
             fprintf(stderr, "ds4: f16 activation cache: %lu hits, %lu misses\n",
@@ -1327,6 +1353,11 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_xh_cache_bytes = 0;
         g_xh_cache_src = NULL;
         g_xh_cache_count = 0;
+    }
+    if (g_xh_async_buf) {
+        (void)cudaFree(g_xh_async_buf);
+        g_xh_async_buf = NULL;
+        g_xh_async_bytes = 0;
     }
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
@@ -1515,11 +1546,7 @@ extern "C" int ds4_gpu_end_async(void) {
 }
 extern "C" int ds4_gpu_sync_async(void) {
     if (!g_async_ready) return 1;
-    cudaEvent_t ev;
-    if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) return 0;
-    if (cudaEventRecord(ev, g_async_stream) != cudaSuccess) { (void)cudaEventDestroy(ev); return 0; }
-    if (cudaStreamWaitEvent(0, ev, 0) != cudaSuccess) { (void)cudaEventDestroy(ev); return 0; }
-    (void)cudaEventDestroy(ev);
+    (void)cudaStreamSynchronize(g_async_stream);
     return 1;
 }
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
@@ -6170,10 +6197,10 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, g_active_stream>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
-        matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+        matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, g_active_stream>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq,
@@ -6186,7 +6213,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     if (getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL && blocks <= 32u) {
         dim3 bgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)n_tok, 1);
-        matmul_q8_0_preq_batch_warp8_kernel<<<bgrid, 256>>>(
+        matmul_q8_0_preq_batch_warp8_kernel<<<bgrid, 256, 0, g_active_stream>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq,
@@ -6199,7 +6226,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 batch warp launch");
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
-    matmul_q8_0_preq_kernel<<<grid, 256>>>((float *)out->ptr,
+    matmul_q8_0_preq_kernel<<<grid, 256, 0, g_active_stream>>>((float *)out->ptr,
                                            reinterpret_cast<const unsigned char *>(wptr),
                                            xq,
                                            xscale,

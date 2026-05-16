@@ -3648,7 +3648,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t raw_count;
     __shared__ uint32_t raw_first_idx;
-    __shared__ float4 kv_shared[ROWS_PER_STAGE * 128];
+    __shared__ __half2 kv_shared_h2[ROWS_PER_STAGE * 2 * 256];
 
     uint32_t qpos = pos0 + t;
     uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
@@ -3693,11 +3693,19 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
         : NULL;
     float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 q1 = q0, q2 = q0, q3 = q0;
+    __half2 qh[8];
     if (valid_head) {
         q0 = q4[lane +  0u];
         q1 = q4[lane + 32u];
         q2 = q4[lane + 64u];
         q3 = q4[lane + 96u];
+        qh[0] = __floats2half2_rn(q0.x, q0.y); qh[1] = __floats2half2_rn(q0.z, q0.w);
+        qh[2] = __floats2half2_rn(q1.x, q1.y); qh[3] = __floats2half2_rn(q1.z, q1.w);
+        qh[4] = __floats2half2_rn(q2.x, q2.y); qh[5] = __floats2half2_rn(q2.z, q2.w);
+        qh[6] = __floats2half2_rn(q3.x, q3.y); qh[7] = __floats2half2_rn(q3.z, q3.w);
+    } else {
+        __half2 z = __float2half2_rn(0.0f);
+        for (int i = 0; i < 8; i++) qh[i] = z;
     }
 
     float max_s = -INFINITY;
@@ -3705,32 +3713,51 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 o1 = o0, o2 = o0, o3 = o0;
 
-    for (uint32_t row0 = 0; row0 < n_score; row0 += ROWS_PER_STAGE) {
-        const uint32_t nr = n_score - row0 < ROWS_PER_STAGE ? n_score - row0 : ROWS_PER_STAGE;
+    for (uint32_t row0 = 0; row0 < n_score; row0 += ROWS_PER_STAGE * 2u) {
+        const uint32_t nr = n_score - row0 < ROWS_PER_STAGE * 2u ? n_score - row0 : ROWS_PER_STAGE * 2u;
         for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const uint32_t comp_idx = sr < raw_count
-                ? 0u
-                : (uint32_t)topk[(uint64_t)t * top_k + (sr - raw_count)];
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_idx * head_dim);
-            kv_shared[off] = src[c4];
+            float4 v;
+            if (sr < raw_count) {
+                v = ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4];
+            } else {
+                const uint32_t comp_idx = (uint32_t)topk[(uint64_t)t * top_k + (sr - raw_count)];
+                v = ((const float4 *)(comp_kv + (uint64_t)comp_idx * head_dim))[c4];
+            }
+            __half2 *dst = kv_shared_h2 + rr * 256u + c4 * 2u;
+            dst[0] = __floats2half2_rn(v.x, v.y);
+            dst[1] = __floats2half2_rn(v.z, v.w);
         }
         __syncthreads();
         if (valid_head) {
             for (uint32_t rr = 0; rr < nr; rr++) {
-                const float4 *kv4 = kv_shared + rr * 128u;
-                float4 k0 = kv4[lane +  0u];
-                float4 k1 = kv4[lane + 32u];
-                float4 k2 = kv4[lane + 64u];
-                float4 k3 = kv4[lane + 96u];
-                float score = dot4_f32(q0, k0) +
-                              dot4_f32(q1, k1) +
-                              dot4_f32(q2, k2) +
-                              dot4_f32(q3, k3);
+                const __half2 *kvh = kv_shared_h2 + rr * 256u;
+                uint32_t b = lane * 2u;
+                __half2 kh[8];
+                kh[0] = kvh[b+0u]; kh[1] = kvh[b+1u];
+                kh[2] = kvh[b+64u]; kh[3] = kvh[b+65u];
+                kh[4] = kvh[b+128u]; kh[5] = kvh[b+129u];
+                kh[6] = kvh[b+192u]; kh[7] = kvh[b+193u];
+                __half2 dot = __hmul2(qh[0], kh[0]);
+                dot = __hfma2(qh[1], kh[1], dot);
+                dot = __hfma2(qh[2], kh[2], dot);
+                dot = __hfma2(qh[3], kh[3], dot);
+                dot = __hfma2(qh[4], kh[4], dot);
+                dot = __hfma2(qh[5], kh[5], dot);
+                dot = __hfma2(qh[6], kh[6], dot);
+                dot = __hfma2(qh[7], kh[7], dot);
+                float score = __half2float(dot.x) + __half2float(dot.y);
+                float2 fa, fb;
+                fa = __half22float2(kh[0]); fb = __half22float2(kh[1]);
+                float4 k0 = make_float4(fa.x, fa.y, fb.x, fb.y);
+                fa = __half22float2(kh[2]); fb = __half22float2(kh[3]);
+                float4 k1 = make_float4(fa.x, fa.y, fb.x, fb.y);
+                fa = __half22float2(kh[4]); fb = __half22float2(kh[5]);
+                float4 k2 = make_float4(fa.x, fa.y, fb.x, fb.y);
+                fa = __half22float2(kh[6]); fb = __half22float2(kh[7]);
+                float4 k3 = make_float4(fa.x, fa.y, fb.x, fb.y);
                 score = warp_sum_f32(score) * scale;
                 score = __shfl_sync(0xffffffffu, score, 0);
 
@@ -3804,7 +3831,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
     const uint32_t head = head_group * 8u + warp;
     const bool valid_head = head < n_head;
 
-    __shared__ float4 kv_shared[4 * 128];
+    __shared__ __half2 kv_shared_h2[8 * 256];
 
     const uint32_t raw_count = window != 0u && t + 1u > window ? window : t + 1u;
     const uint32_t raw_start = t + 1u - raw_count;
@@ -3820,11 +3847,19 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         : NULL;
     float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 q1 = q0, q2 = q0, q3 = q0;
+    __half2 qh[8];
     if (valid_head) {
         q0 = q4[lane +  0u];
         q1 = q4[lane + 32u];
         q2 = q4[lane + 64u];
         q3 = q4[lane + 96u];
+        qh[0] = __floats2half2_rn(q0.x, q0.y); qh[1] = __floats2half2_rn(q0.z, q0.w);
+        qh[2] = __floats2half2_rn(q1.x, q1.y); qh[3] = __floats2half2_rn(q1.z, q1.w);
+        qh[4] = __floats2half2_rn(q2.x, q2.y); qh[5] = __floats2half2_rn(q2.z, q2.w);
+        qh[6] = __floats2half2_rn(q3.x, q3.y); qh[7] = __floats2half2_rn(q3.z, q3.w);
+    } else {
+        __half2 z = __float2half2_rn(0.0f);
+        for (int i = 0; i < 8; i++) qh[i] = z;
     }
 
     float max_s = -INFINITY;
@@ -3832,29 +3867,50 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
     float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 o1 = o0, o2 = o0, o3 = o0;
 
-    for (uint32_t row0 = 0; row0 < n_score; row0 += 4u) {
-        const uint32_t nr = n_score - row0 < 4u ? n_score - row0 : 4u;
+    for (uint32_t row0 = 0; row0 < n_score; row0 += 8u) {
+        const uint32_t nr = n_score - row0 < 8u ? n_score - row0 : 8u;
         for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
-            kv_shared[off] = src[c4];
+            float4 v;
+            if (sr < raw_count) {
+                v = ((const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim))[c4];
+            } else {
+                v = ((const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim))[c4];
+            }
+            __half2 *dst = kv_shared_h2 + rr * 256u + c4 * 2u;
+            dst[0] = __floats2half2_rn(v.x, v.y);
+            dst[1] = __floats2half2_rn(v.z, v.w);
         }
         __syncthreads();
         if (valid_head) {
             for (uint32_t rr = 0; rr < nr; rr++) {
-                const float4 *kv4 = kv_shared + rr * 128u;
-                float4 k0 = kv4[lane +  0u];
-                float4 k1 = kv4[lane + 32u];
-                float4 k2 = kv4[lane + 64u];
-                float4 k3 = kv4[lane + 96u];
-                float score = dot4_f32(q0, k0) +
-                              dot4_f32(q1, k1) +
-                              dot4_f32(q2, k2) +
-                              dot4_f32(q3, k3);
+                const __half2 *kvh = kv_shared_h2 + rr * 256u;
+                uint32_t b = lane * 2u;
+                __half2 kh[8];
+                kh[0] = kvh[b+0u]; kh[1] = kvh[b+1u];
+                kh[2] = kvh[b+64u]; kh[3] = kvh[b+65u];
+                kh[4] = kvh[b+128u]; kh[5] = kvh[b+129u];
+                kh[6] = kvh[b+192u]; kh[7] = kvh[b+193u];
+                __half2 dot = __hmul2(qh[0], kh[0]);
+                dot = __hfma2(qh[1], kh[1], dot);
+                dot = __hfma2(qh[2], kh[2], dot);
+                dot = __hfma2(qh[3], kh[3], dot);
+                dot = __hfma2(qh[4], kh[4], dot);
+                dot = __hfma2(qh[5], kh[5], dot);
+                dot = __hfma2(qh[6], kh[6], dot);
+                dot = __hfma2(qh[7], kh[7], dot);
+                float score = __half2float(dot.x) + __half2float(dot.y);
+                float2 fa, fb;
+                fa = __half22float2(kh[0]); fb = __half22float2(kh[1]);
+                float4 k0 = make_float4(fa.x, fa.y, fb.x, fb.y);
+                fa = __half22float2(kh[2]); fb = __half22float2(kh[3]);
+                float4 k1 = make_float4(fa.x, fa.y, fb.x, fb.y);
+                fa = __half22float2(kh[4]); fb = __half22float2(kh[5]);
+                float4 k2 = make_float4(fa.x, fa.y, fb.x, fb.y);
+                fa = __half22float2(kh[6]); fb = __half22float2(kh[7]);
+                float4 k3 = make_float4(fa.x, fa.y, fb.x, fb.y);
                 score = warp_sum_f32(score) * scale;
                 score = __shfl_sync(0xffffffffu, score, 0);
 

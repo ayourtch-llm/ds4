@@ -8842,6 +8842,16 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_routed_down = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
     g->batch_routed_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
 
+    {
+        const uint64_t async_max_dim = DS4_N_EMBD > shared_dim ? DS4_N_EMBD : shared_dim;
+        const uint64_t async_f16_elems = pc * async_max_dim;
+        const uint64_t async_blocks = (async_max_dim + 31u) / 32u;
+        const uint64_t async_xq_bytes = pc * async_blocks * 32u;
+        const uint64_t async_scale_off = (async_xq_bytes + 15u) & ~15ull;
+        const uint64_t async_scratch = async_scale_off + pc * async_blocks * sizeof(float);
+        ds4_gpu_preallocate_async(async_f16_elems, async_scratch);
+    }
+
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
         layer_cache_ok = g->layer_raw_cache[il] != NULL;
@@ -12529,32 +12539,104 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
-    if (ok) ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
-                                                   g->batch_routed_gate,
-                                                   g->batch_routed_up,
-                                                   g->batch_routed_mid,
-                                                   g->batch_routed_down,
-                                                   model->map,
-                                                   model->size,
-                                                   layer->ffn_gate_exps->abs_offset,
-                                                   layer->ffn_up_exps->abs_offset,
-                                                   layer->ffn_down_exps->abs_offset,
-                                                   layer->ffn_gate_exps->type,
-                                                   layer->ffn_down_exps->type,
-                                                   gate_expert_bytes,
-                                                   gate_row_bytes,
-                                                   down_expert_bytes,
-                                                   down_row_bytes,
-                                                   (uint32_t)expert_in_dim,
-                                                   (uint32_t)down_in_dim,
-                                                   (uint32_t)routed_out_dim,
-                                                   g->batch_router_selected,
-                                                   g->batch_router_weights,
-                                                   DS4_N_EXPERT_USED,
-                                                   DS4_SWIGLU_CLAMP_EXP,
-                                                   g->batch_ffn_norm,
-                                                   n_tokens,
-                                                   &g->batch_routed_mid_is_f16) != 0;
+    {
+        int async_shared = ok && n_tokens > 1 && ds4_gpu_begin_async();
+        if (async_shared) {
+            ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_gate,
+                                              model->map,
+                                              model->size,
+                                              layer->ffn_gate_shexp->abs_offset,
+                                              DS4_N_EMBD,
+                                              shared_dim,
+                                              g->batch_ffn_norm,
+                                              n_tokens) != 0;
+            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_up,
+                                                      model->map,
+                                                      model->size,
+                                                      layer->ffn_up_shexp->abs_offset,
+                                                      DS4_N_EMBD,
+                                                      shared_dim,
+                                                      g->batch_ffn_norm,
+                                                      n_tokens) != 0;
+            if (ok) ok = ds4_gpu_swiglu_tensor(g->batch_shared_mid,
+                                                 g->batch_shared_gate,
+                                                 g->batch_shared_up,
+                                                 (uint32_t)((uint64_t)n_tokens * shared_dim),
+                                                 0.0f,
+                                                 1.0f) != 0;
+            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_out,
+                                                      model->map,
+                                                      model->size,
+                                                      layer->ffn_down_shexp->abs_offset,
+                                                      shared_dim,
+                                                      DS4_N_EMBD,
+                                                      g->batch_shared_mid,
+                                                      n_tokens) != 0;
+            ds4_gpu_end_async();
+        }
+
+        if (ok) ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
+                                                       g->batch_routed_gate,
+                                                       g->batch_routed_up,
+                                                       g->batch_routed_mid,
+                                                       g->batch_routed_down,
+                                                       model->map,
+                                                       model->size,
+                                                       layer->ffn_gate_exps->abs_offset,
+                                                       layer->ffn_up_exps->abs_offset,
+                                                       layer->ffn_down_exps->abs_offset,
+                                                       layer->ffn_gate_exps->type,
+                                                       layer->ffn_down_exps->type,
+                                                       gate_expert_bytes,
+                                                       gate_row_bytes,
+                                                       down_expert_bytes,
+                                                       down_row_bytes,
+                                                       (uint32_t)expert_in_dim,
+                                                       (uint32_t)down_in_dim,
+                                                       (uint32_t)routed_out_dim,
+                                                       g->batch_router_selected,
+                                                       g->batch_router_weights,
+                                                       DS4_N_EXPERT_USED,
+                                                       DS4_SWIGLU_CLAMP_EXP,
+                                                       g->batch_ffn_norm,
+                                                       n_tokens,
+                                                       &g->batch_routed_mid_is_f16) != 0;
+
+        if (async_shared) {
+            if (ok) ok = ds4_gpu_sync_async() != 0;
+        } else if (ok) {
+            ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_gate,
+                                              model->map,
+                                              model->size,
+                                              layer->ffn_gate_shexp->abs_offset,
+                                              DS4_N_EMBD,
+                                              shared_dim,
+                                              g->batch_ffn_norm,
+                                              n_tokens) != 0;
+            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_up,
+                                                      model->map,
+                                                      model->size,
+                                                      layer->ffn_up_shexp->abs_offset,
+                                                      DS4_N_EMBD,
+                                                      shared_dim,
+                                                      g->batch_ffn_norm,
+                                                      n_tokens) != 0;
+            if (ok) ok = ds4_gpu_swiglu_tensor(g->batch_shared_mid,
+                                                 g->batch_shared_gate,
+                                                 g->batch_shared_up,
+                                                 (uint32_t)((uint64_t)n_tokens * shared_dim),
+                                                 0.0f,
+                                                 1.0f) != 0;
+            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_out,
+                                                      model->map,
+                                                      model->size,
+                                                      layer->ffn_down_shexp->abs_offset,
+                                                      shared_dim,
+                                                      DS4_N_EMBD,
+                                                      g->batch_shared_mid,
+                                                      n_tokens) != 0;
+        }
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->batch_routed_gate,
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim, il, pos0);
@@ -12573,39 +12655,7 @@ static bool metal_graph_encode_layer_ffn_batch(
         metal_graph_debug_dump_tensor("ffn_moe_out", g->batch_routed_out,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
-    DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_gate,
-                                              model->map,
-                                              model->size,
-                                              layer->ffn_gate_shexp->abs_offset,
-                                              DS4_N_EMBD,
-                                              shared_dim,
-                                              g->batch_ffn_norm,
-                                              n_tokens) != 0;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_up,
-                                              model->map,
-                                              model->size,
-                                              layer->ffn_up_shexp->abs_offset,
-                                              DS4_N_EMBD,
-                                              shared_dim,
-                                              g->batch_ffn_norm,
-                                              n_tokens) != 0;
-    DS4_METAL_PROFILE_FFN_STAGE("shared_gate_up");
-    if (ok) ok = ds4_gpu_swiglu_tensor(g->batch_shared_mid,
-                                         g->batch_shared_gate,
-                                         g->batch_shared_up,
-                                         (uint32_t)((uint64_t)n_tokens * shared_dim),
-                                         0.0f,
-                                         1.0f) != 0;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_out,
-                                              model->map,
-                                              model->size,
-                                              layer->ffn_down_shexp->abs_offset,
-                                              shared_dim,
-                                              DS4_N_EMBD,
-                                              g->batch_shared_mid,
-                                              n_tokens) != 0;
-    DS4_METAL_PROFILE_FFN_STAGE("shared_down");
+    DS4_METAL_PROFILE_FFN_STAGE("routed_moe+shexp");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_shexp", g->batch_shared_out,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);

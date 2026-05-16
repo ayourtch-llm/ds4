@@ -35,6 +35,10 @@ int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+int ds4_gpu_begin_async(void);
+int ds4_gpu_end_async(void);
+int ds4_gpu_sync_async(void);
+int ds4_gpu_preallocate_async(uint64_t max_f16_elems, uint64_t max_scratch_bytes);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);

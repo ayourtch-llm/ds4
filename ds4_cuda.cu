@@ -617,7 +617,11 @@ static const __half *cuda_q8_f16_ptr(
     }
     const uint64_t blocks = (in_dim + 31) / 32;
     const uint64_t n = in_dim * out_dim;
-    dequant_q8_0_to_f16_kernel<<<(n + 255) / 256, 256>>>(dev,
+    /* Launch on g_active_stream so consumers on the same stream (e.g. the
+     * async shared expert GEMM on g_async_stream) are naturally ordered
+     * after this lazy dequant. g_async_stream is cudaStreamNonBlocking, so
+     * a launch on stream 0 would NOT implicitly serialize with it. */
+    dequant_q8_0_to_f16_kernel<<<(n + 255) / 256, 256, 0, g_active_stream>>>(dev,
                                                           (const unsigned char *)q8,
                                                           in_dim,
                                                           out_dim,

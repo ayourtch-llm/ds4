@@ -8180,6 +8180,7 @@ typedef struct {
     ds4_gpu_tensor *batch_qr;
     ds4_gpu_tensor *batch_qr_norm;
     ds4_gpu_tensor *batch_q;
+    ds4_gpu_tensor *batch_q_f16;
     ds4_gpu_tensor *batch_kv_raw;
     ds4_gpu_tensor *batch_kv;
     ds4_gpu_tensor *batch_comp_kv;
@@ -8248,6 +8249,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_comp_kv);
     ds4_gpu_tensor_free(g->batch_kv);
     ds4_gpu_tensor_free(g->batch_kv_raw);
+    ds4_gpu_tensor_free(g->batch_q_f16);
     ds4_gpu_tensor_free(g->batch_q);
     ds4_gpu_tensor_free(g->batch_qr_norm);
     ds4_gpu_tensor_free(g->batch_qr);
@@ -8814,6 +8816,7 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_qr = ds4_gpu_tensor_alloc(pc * q_rank * sizeof(float));
     g->batch_qr_norm = ds4_gpu_tensor_alloc(pc * q_rank * sizeof(float));
     g->batch_q = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
+    g->batch_q_f16 = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(uint16_t));
     g->batch_kv_raw = ds4_gpu_tensor_alloc(pc * DS4_N_HEAD_DIM * sizeof(float));
     g->batch_kv = ds4_gpu_tensor_alloc(pc * DS4_N_HEAD_DIM * sizeof(float));
     g->batch_comp_kv = ds4_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
@@ -11247,48 +11250,82 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("q_a_norm");
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_q,
-                                              model->map,
-                                              model->size,
-                                              layer->attn_q_b->abs_offset,
-                                              q_rank,
-                                              q_dim,
-                                              g->batch_qr_norm,
-                                              n_tokens) != 0;
-    if (ok) {
-        metal_graph_debug_dump_tensor("Qraw", g->batch_q,
-                                      (uint64_t)n_tokens * q_dim, il, pos0);
-    }
-    DS4_METAL_PROFILE_Q_STAGE("q_b");
-    if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->batch_q,
+    /* Try f16 Q path: cuBLAS f16 output + fused norm/rope from f16 input.
+     * Requires q8 f16 weight cache (unavailable in quality mode or when
+     * GPU memory budget is exhausted). Gate on n_tokens >= 2048 where the
+     * f16-out kernel actually wins; short prefills regress throughput and
+     * shift top-token choices on borderline prompts. Fall back to f32 if
+     * the f16 matmul fails (e.g. weight cache unavailable). */
+    {
+        int q_f16_ok = 0;
+        if (ok && !g->quality && n_tokens >= 2048 && g->batch_q_f16 &&
+            getenv("DS4_CUDA_NO_Q_F16") == NULL) {
+            q_f16_ok = ds4_gpu_matmul_q8_0_f16out_tensor(g->batch_q_f16,
+                                                            model->map,
+                                                            model->size,
+                                                            layer->attn_q_b->abs_offset,
+                                                            q_rank,
+                                                            q_dim,
+                                                            g->batch_qr_norm,
+                                                            n_tokens);
+            if (q_f16_ok) {
+                DS4_METAL_PROFILE_Q_STAGE("q_b_f16");
+                ok = ds4_gpu_head_rms_norm_rope_tail_f16in_tensor(g->batch_q,
+                                                                     g->batch_q_f16,
+                                                                     n_tokens,
+                                                                     DS4_N_HEAD,
+                                                                     DS4_N_HEAD_DIM,
+                                                                     DS4_N_ROT,
+                                                                     pos0,
+                                                                     compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                                     false,
+                                                                     freq_base,
+                                                                     freq_scale,
+                                                                     ext_factor,
+                                                                     attn_factor,
+                                                                     DS4_ROPE_YARN_BETA_FAST,
+                                                                     DS4_ROPE_YARN_BETA_SLOW,
+                                                                     DS4_RMS_EPS) != 0;
+                DS4_METAL_PROFILE_Q_STAGE("norm_rope_f16in");
+            }
+        }
+        if (ok && !q_f16_ok) {
+        ok = ds4_gpu_matmul_q8_0_tensor(g->batch_q,
+                                          model->map,
+                                          model->size,
+                                          layer->attn_q_b->abs_offset,
+                                          q_rank,
+                                          q_dim,
+                                          g->batch_qr_norm,
+                                          n_tokens) != 0;
+        DS4_METAL_PROFILE_Q_STAGE("q_b");
+        if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->batch_q,
+                                                    n_tokens,
+                                                    DS4_N_HEAD,
+                                                    DS4_N_HEAD_DIM,
+                                                    DS4_RMS_EPS) != 0;
+        DS4_METAL_PROFILE_Q_STAGE("head_norm");
+        if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_q,
                                                 n_tokens,
                                                 DS4_N_HEAD,
                                                 DS4_N_HEAD_DIM,
-                                                DS4_RMS_EPS) != 0;
-    if (ok) {
-        metal_graph_debug_dump_tensor("Qnorm", g->batch_q,
-                                      (uint64_t)n_tokens * q_dim, il, pos0);
+                                                DS4_N_ROT,
+                                                pos0,
+                                                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                false,
+                                                freq_base,
+                                                freq_scale,
+                                                ext_factor,
+                                                attn_factor,
+                                                DS4_ROPE_YARN_BETA_FAST,
+                                                DS4_ROPE_YARN_BETA_SLOW) != 0;
+        DS4_METAL_PROFILE_Q_STAGE("rope");
+        }
     }
-    DS4_METAL_PROFILE_Q_STAGE("head_norm");
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_q,
-                                            n_tokens,
-                                            DS4_N_HEAD,
-                                            DS4_N_HEAD_DIM,
-                                            DS4_N_ROT,
-                                            pos0,
-                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                            false,
-                                            freq_base,
-                                            freq_scale,
-                                            ext_factor,
-                                            attn_factor,
-                                            DS4_ROPE_YARN_BETA_FAST,
-                                            DS4_ROPE_YARN_BETA_SLOW) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("Qcur", g->batch_q,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
-    DS4_METAL_PROFILE_Q_STAGE("rope");
     DS4_METAL_PROFILE_ATTN_STAGE("q_path");
     if (!qkv_rms_fused) {
         if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_kv_raw,

@@ -4784,6 +4784,19 @@ __global__ static void zero_kernel(float *out, uint64_t n) {
     if (i < n) out[i] = 0.0f;
 }
 
+__global__ static void zero_i64_kernel(unsigned long long *out, uint64_t n) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = 0ull;
+}
+
+__global__ static void i64_to_f32_kernel(float *out, const long long *in, uint64_t n, float inv_scale) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        long long q = in[i];
+        out[i] = (float)((double)q * (double)inv_scale);
+    }
+}
+
 __global__ static void indexer_scores_kernel(
         float *scores,
         const float *q,
@@ -10165,7 +10178,9 @@ __global__ static void moe_down_expert_tile16_row2048_kernel(
         uint32_t midq_blocks,
         uint32_t out_dim,
         uint32_t n_expert,
-        uint32_t atomic_out) {
+        uint32_t atomic_out,
+        unsigned long long *atomic_out_i64,
+        float fixed_scale) {
     uint32_t tile = blockIdx.y;
     if (tile >= *tile_total) return;
     uint32_t local_start = tile_starts[tile];
@@ -10212,7 +10227,11 @@ __global__ static void moe_down_expert_tile16_row2048_kernel(
         for (uint32_t p = 0; p < np; p++) {
             acc[p] = quarter_warp_sum_f32(acc[p], lane);
             if (lane == 0) {
-                if (atomic_out) {
+                if (atomic_out_i64) {
+                    uint32_t tok = pair[p] / n_expert;
+                    long long q = __double2ll_rn((double)acc[p] * (double)fixed_scale);
+                    atomicAdd(atomic_out_i64 + (uint64_t)tok * out_dim + row, (unsigned long long)q);
+                } else if (atomic_out) {
                     uint32_t tok = pair[p] / n_expert;
                     atomicAdd(down_out + (uint64_t)tok * out_dim + row, acc[p]);
                 } else {
@@ -10904,6 +10923,24 @@ static int routed_moe_launch(
                 zero_kernel<<<(n + 255u) / 256u, 256>>>((float *)out->ptr, n);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe atomic zero launch");
             }
+            const uint32_t use_int64_down = use_atomic_down &&
+                getenv("DS4_CUDA_MOE_INT64_DOWN") != NULL;
+            static unsigned long long *g_moe_atomic_i64 = NULL;
+            static uint64_t g_moe_atomic_i64_n = 0;
+            unsigned long long *atomic_i64 = NULL;
+            const float fixed_scale = 4294967296.0f;
+            const float fixed_inv_scale = 1.0f / 4294967296.0f;
+            if (use_int64_down) {
+                uint64_t n = (uint64_t)n_tokens * out_dim;
+                if (g_moe_atomic_i64_n < n) {
+                    if (g_moe_atomic_i64) cudaFree(g_moe_atomic_i64);
+                    cudaMalloc(&g_moe_atomic_i64, n * sizeof(unsigned long long));
+                    g_moe_atomic_i64_n = n;
+                }
+                atomic_i64 = g_moe_atomic_i64;
+                zero_i64_kernel<<<(n + 255u) / 256u, 256>>>(atomic_i64, n);
+                ok = ok && cuda_ok(cudaGetLastError(), "routed_moe i64 zero launch");
+            }
             if (use_direct_down_sum6) {
                 /* The direct decode kernel writes the final token row. */
             } else if (sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts &&
@@ -10929,7 +10966,8 @@ static int routed_moe_launch(
                             use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                             down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                             down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
-                            midq_blocks, out_dim, n_expert, use_atomic_down);
+                            midq_blocks, out_dim, n_expert, use_atomic_down,
+                            atomic_i64, fixed_scale);
                     }
                 } else if (use_down_tile16) {
                     dim3 tgrid((out_dim + 31u) / 32u, down_tile_capacity, 1);
@@ -10992,6 +11030,12 @@ static int routed_moe_launch(
                     n_expert);
             }
             ok = cuda_ok(cudaGetLastError(), "routed_moe down launch");
+            if (use_int64_down && atomic_i64) {
+                uint64_t n = (uint64_t)n_tokens * out_dim;
+                i64_to_f32_kernel<<<(n + 255u) / 256u, 256>>>(
+                    (float *)out->ptr, (const long long *)atomic_i64, n, fixed_inv_scale);
+                ok = ok && cuda_ok(cudaGetLastError(), "routed_moe i64->f32 launch");
+            }
         }
         if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
         if (ok && !use_atomic_down && !use_direct_down_sum6) {
